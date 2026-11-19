@@ -1,0 +1,15 @@
+{
+  "name": "MakerPulseV2",
+  "version": "2.0.0-dev",
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "firmware/v2.0.0-dev/bootloader.bin", "offset": 4096 },
+        { "path": "firmware/v2.0.0-dev/partitions.bin", "offset": 32768 },
+        { "path": "firmware/v2.0.0-dev/boot_app0.bin", "offset": 57344 },
+        { "path": "firmware/v2.0.0-dev/firmware.bin", "offset": 65536 }
+      ]
+    }
+  ]
+}
