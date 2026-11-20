@@ -671,10 +671,17 @@ void updateTimerDoneDialogState() {
 // "MakerPulse Colours.pdf" and docs/adr/0002-fixed-shell-colour-palette.md
 // for where these came from and how BG/PANEL/STROKE/ACCENT were derived
 // from each case's sampled body color (same hue family, pale tint for the
-// screen background, WCAG AA-verified against the shared ink/dim). Text
-// (ink) and dim are intentionally hue-NEUTRAL constants shared by all 8 --
-// not derived per shell -- so every preset gets the same contrast margin
-// instead of needing 8 separate manual checks.
+// screen background, explicitly checked for (a) WCAG AA against the shared
+// ink/dim and (b) pairwise RGB565 distinctness -- the first version of
+// this table passed (a) but not (b): several presets' tints rounded to the
+// *same* 16-bit pixel value once quantized, so switching shells visibly
+// changed nothing. Two shells (Muted White, Muted Green) have such low
+// source saturation that preserving their "hue" produced an unstable,
+// near-arbitrary tint that collided with unrelated shells; those two are
+// derived as neutral (zero-saturation) tints instead. Text (ink) and dim
+// are intentionally hue-NEUTRAL constants shared by all 8 -- not derived
+// per shell -- so every preset gets the same contrast margin instead of
+// needing 8 separate manual checks.
 struct ShellColourPalette {
   const char* key;
   const char* label;
@@ -683,20 +690,20 @@ struct ShellColourPalette {
 };
 
 static const ShellColourPalette SHELL_COLOURS[] = {
-  { "muted-white",      "Muted White",      0xD679, 0xEF5D, 0xDEDB, 0xBDB6, 0x7224 },
-  { "pastel-ice",       "Pastel Ice",       0x9DD7, 0xEF7D, 0xD6FC, 0xADF8, 0x234E },
-  { "muted-blue",       "Muted Blue",       0x6C54, 0xEF5D, 0xD6DC, 0xADB8, 0x224E },
-  { "army-blue",        "Army Blue",        0x324D, 0xE75D, 0xD6DC, 0xA5B9, 0x222E },
-  { "muted-green",      "Muted Green",      0x5B2B, 0xEF5D, 0xDEFB, 0xB5D6, 0x43A4 },
-  { "army-red",         "Army Red",         0x8903, 0xEF3C, 0xE69A, 0xCD34, 0x78E3 },
-  { "pastel-peach",     "Pastel Peach",     0xF674, 0xEF5C, 0xE6DA, 0xCDD4, 0x8A61 },
-  { "mandarin-orange",  "Mandarin Orange",  0xE3C7, 0xEF5C, 0xE6DA, 0xCD94, 0x81E2 },
+  { "muted-white",      "Muted White",      0xD679, 0xE71C, 0xCE59, 0xA514, 0x51C5 },
+  { "pastel-ice",       "Pastel Ice",       0x9DD7, 0xD71C, 0xBE7A, 0x7D97, 0x1AAC },
+  { "muted-blue",       "Muted Blue",       0x6C54, 0xD6DC, 0xB61A, 0x74B7, 0x19CC },
+  { "army-blue",        "Army Blue",        0x324D, 0xC67C, 0xA5BA, 0x6436, 0x19AC },
+  { "muted-green",      "Muted Green",      0x5B2B, 0xD69A, 0xBDF7, 0x9492, 0x3A85 },
+  { "army-red",         "Army Red",         0x8903, 0xE617, 0xDCF3, 0xCAAA, 0x60C2 },
+  { "pastel-peach",     "Pastel Peach",     0xF674, 0xEF1A, 0xE656, 0xD50D, 0x69E1 },
+  { "mandarin-orange",  "Mandarin Orange",  0xE3C7, 0xEEB9, 0xDDF4, 0xD44B, 0x6982 },
 };
 static const int SHELL_COLOUR_COUNT = sizeof(SHELL_COLOURS) / sizeof(SHELL_COLOURS[0]);
 
 // Hue-neutral constant ink/dim, shared by every shell colour.
-static const uint16_t SHELL_INK = 0x18C2;
-static const uint16_t SHELL_DIM = 0x5ACA;
+static const uint16_t SHELL_INK = 0x10A2;
+static const uint16_t SHELL_DIM = 0x4A69;
 
 
 bool isValidShellColourKey(const String& key) {
