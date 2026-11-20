@@ -39,33 +39,6 @@ void appendTimezoneOptions(String& page, const String& selectedKey) {
 }
 
 
-void appendHomeWidgetOptions(String& page, const String& selectedKey) {
-  const HomeWidgetType types[] = {
-    HOME_WIDGET_WEEK,
-    HOME_WIDGET_TIMER,
-    HOME_WIDGET_RAIN,
-    HOME_WIDGET_OUTDOOR,
-    HOME_WIDGET_KP,
-    HOME_WIDGET_UV,
-    HOME_WIDGET_WIND,
-    HOME_WIDGET_SUN,
-    HOME_WIDGET_PSI,
-    HOME_WIDGET_BUS
-  };
-
-  for (HomeWidgetType type : types) {
-    const char* key = homeWidgetKey(type);
-    page += "<option value='";
-    page += key;
-    page += "'";
-    if (selectedKey == key) page += " selected";
-    page += ">";
-    page += homeWidgetLabel(type);
-    page += "</option>";
-  }
-}
-
-
 static String htmlEscape(const String& s) {
   String out;
   out.reserve(s.length());
@@ -108,19 +81,14 @@ static String shellColourPreviewCss(const String& key) {
 // WEB SERVER
 // =========================================================
 void handleRoot() {
-  String shellColour = prefs.getString("shellColour", "muted-white");
-  if (!isValidShellColourKey(shellColour)) shellColour = "muted-white";
+  String shellColour = prefs.getString("shellColour", "sage");
+  if (!isValidShellColourKey(shellColour)) shellColour = "sage";
   String units  = prefs.getString("units", "metric");
   String region = prefs.getString("region", "europe");
   String tz     = sanitizeTimezoneKey(prefs.getString("tz", "singapore"));
   String nickname = prefs.getString("nickname", "");
-  bool flashMode = prefs.getBool("flashMode", false);
   String orientation = prefs.getString("orientation", "top");
   if (orientation != "bottom") orientation = "top";
-  String homeSlotKeys[HOME_SLOT_COUNT];
-  for (int i = 0; i < HOME_SLOT_COUNT; i++) {
-    homeSlotKeys[i] = prefs.getString((String("homeSlot") + String(i)).c_str(), homeWidgetKey(homeWidgetSlots[i]));
-  }
 
   String page;
   page.reserve(21000);
@@ -198,7 +166,7 @@ void handleRoot() {
   page += "<div class='layout'><div class='stack'>";
 
   page += "<div class='panel' data-panel='theme'>";
-  page += "<button type='button' class='panel-toggle' aria-expanded='true'><h2>Shell colour</h2><span class='panel-chevron'>&#9662;</span></button>";
+  page += "<button type='button' class='panel-toggle' aria-expanded='true'><h2>Colourway</h2><span class='panel-chevron'>&#9662;</span></button>";
   page += "<div class='panel-body'>";
   page += "<p>Pick the preset that matches your MakerPulseV2's physical case. The screen's colors are fixed to this choice -- there's no separate accent, text, or custom color picker.</p>";
   page += "<div class='grid'>";
@@ -226,6 +194,7 @@ void handleRoot() {
   page += "<span class='settings-title'>General</span>";
   page += "<div class='grid'>";
   page += "<div><label class='label'>MakerPulse nickname</label><input name='nickname' maxlength='24' value='" + htmlEscape(nickname) + "'></div>";
+  page += "<div><label class='label'>Owner name</label><input name='ownerName' maxlength='24' value='" + htmlEscape(ownerName) + "'></div>";
   page += "<div><label class='label'>Auto sleep interval</label><select name='sleepMin'>";
   page += "<option value='0'"  + String(sleepIntervalMin==0?" selected":"")  + ">Never</option>";
   page += "<option value='1'"  + String(sleepIntervalMin==1?" selected":"")  + ">1 minute</option>";
@@ -251,25 +220,13 @@ void handleRoot() {
   page += "</select><div class='muted' style='margin-top:8px;'>Match this to which edge of your MakerPulse the USB cable comes out of.</div></div>";
   page += "</div>";
   page += "</div>";
-  page += "<div class='settings-block'><span class='settings-title'>Timer</span><div class='settings-desc'>Choose the six quick timers shown in the popup menu.</div><div class='timer-slot-grid'>";
-  for (int i = 0; i < 6; i++) {
-    page += "<div class='timer-slot'><div class='timer-slot-head'>Slot " + String(i + 1) + "</div><div class='timer-slot-input'><input type='number' min='1' max='180' name='timer" + String(i) + "' value='" + String(timerPresetMin[i]) + "'><span class='timer-unit'>min</span></div></div>";
-  }
-  page += "</div>";
-  page += "<div style='margin-top:14px;'><span class='settings-title'>Alert behavior</span><label style='display:flex;align-items:center;gap:10px;color:#262220;'><input type='checkbox' name='flashMode' value='1'" + String(flashMode ? " checked" : "") + " style='width:auto;'>Flash screen when timer ends</label></div></div>";
   page += "<div class='settings-block'><span class='settings-title'>Location</span><div class='settings-desc'>Used for weather data and sun times.</div><div class='grid-3'>";
   page += "<div><label class='label'>Location name</label><input name='locname' value='" + htmlEscape(locationName) + "'></div>";
   page += "<div><label class='label'>Latitude</label><input name='lat' value='" + String(LAT, 6) + "'></div>";
   page += "<div><label class='label'>Longitude</label><input name='lng' value='" + String(LNG, 6) + "'></div>";
   page += "</div><div class='footer-note'>Example Singapore: latitude 1.3521, longitude 103.8198.</div></div>";
-  page += "<div class='settings-block'><span class='settings-title'>Air quality (PSI)</span><div class='settings-desc'>NEA haze reading shown on the Weather page and as a Home widget. No API key needed.</div><div class='grid'>";
-  page += "<div><label class='label'>PSI region</label><select name='psiRegion'>";
-  page += "<option value='central'" + String(psiRegion=="central"?" selected":"") + ">Central</option>";
-  page += "<option value='north'"   + String(psiRegion=="north"?" selected":"")   + ">North</option>";
-  page += "<option value='south'"   + String(psiRegion=="south"?" selected":"")   + ">South</option>";
-  page += "<option value='east'"    + String(psiRegion=="east"?" selected":"")    + ">East</option>";
-  page += "<option value='west'"    + String(psiRegion=="west"?" selected":"")    + ">West</option>";
-  page += "</select></div>";
+  page += "<div class='settings-block'><span class='settings-title'>Air quality (PSI)</span><div class='settings-desc'>National 24-hour PSI reading shown on the Weather page, via the data.gov.sg v2 real-time API. Request a free API key at <a href='https://api-open.data.gov.sg/' target='_blank'>api-open.data.gov.sg</a> and enter it below.</div><div class='grid'>";
+  page += "<div><label class='label'>data.gov.sg API key</label><input name='datagovKey' value='" + htmlEscape(datagovApiKey) + "'></div>";
   page += "</div></div>";
   page += "<div class='settings-block'><span class='settings-title'>Bus arrival</span><div class='settings-desc'>Shows next bus times for up to " + String(BUS_MAX_STOPS) + " stops, via LTA DataMall. MakerPulse works out of the box using a shared default key, but shared keys can hit rate limits &mdash; for reliable results, request your own free AccountKey at <a href='https://datamall.lta.gov.sg/content/datamall/en/request-for-api.html' target='_blank'>datamall.lta.gov.sg</a> and enter it below. Find each 5-digit bus stop code on the physical bus stop sign (you can also enter a code directly on the device from the Bus tab). The stop name is looked up automatically once a code is saved; use the override field if you'd rather set your own. Leave service number blank to show the soonest bus of any route.</div>";
   page += "<div><label class='label'>LTA AccountKey</label><input name='ltaKey' value='" + htmlEscape(ltaApiKey) + "'></div>";
@@ -282,23 +239,6 @@ void handleRoot() {
     page += "<div><label class='label'>Name override</label><input name='busLabel" + String(i) + "' maxlength='30' value='" + htmlEscape(busStops[i].label) + "'></div>";
     page += "<div><label class='label'>Service number</label><input name='busSvc" + String(i) + "' maxlength='10' value='" + htmlEscape(busStops[i].svcFilter) + "'></div>";
     page += "</div></div>";
-  }
-  page += "</div>";
-  page += "</div></div>";
-
-  page += "<div class='panel' data-panel='widgets'>";
-  page += "<button type='button' class='panel-toggle' aria-expanded='true'><h2>Widget Customization</h2><span class='panel-chevron'>&#9662;</span></button>";
-  page += "<div class='panel-body'>";
-  page += "<p>Choose which widgets appear in the four Home slots below the clock card.</p>";
-  page += "<div class='grid'>";
-  for (int i = 0; i < HOME_SLOT_COUNT; i++) {
-    page += "<div><label class='label'>";
-    page += homeSlotLabel(i);
-    page += "</label><select name='homeSlot";
-    page += String(i);
-    page += "'>";
-    appendHomeWidgetOptions(page, homeSlotKeys[i]);
-    page += "</select></div>";
   }
   page += "</div>";
   page += "</div></div>";
@@ -354,17 +294,11 @@ void handleSave() {
   String newTz     = server.hasArg("tz") ? server.arg("tz") : timezoneKey;
   String newLoc    = server.hasArg("locname") ? server.arg("locname") : locationName;
   String newNickname = server.hasArg("nickname") ? server.arg("nickname") : deviceNickname;
-  HomeWidgetType newHomeSlots[HOME_SLOT_COUNT];
-  for (int i = 0; i < HOME_SLOT_COUNT; i++) {
-    String key = String("homeSlot") + String(i);
-    String currentKey = homeWidgetKey(homeWidgetSlots[i]);
-    newHomeSlots[i] = homeWidgetFromKey(server.hasArg(key) ? server.arg(key) : currentKey);
-  }
-
+  String newOwnerName = server.hasArg("ownerName") ? server.arg("ownerName") : ownerName;
   float newLat = server.hasArg("lat") ? server.arg("lat").toFloat() : LAT;
   float newLng = server.hasArg("lng") ? server.arg("lng").toFloat() : LNG;
 
-  String newPsiRegion = server.hasArg("psiRegion") ? server.arg("psiRegion") : psiRegion;
+  String newDatagovKey = server.hasArg("datagovKey") ? server.arg("datagovKey") : datagovApiKey;
   String newLtaKey    = server.hasArg("ltaKey") ? server.arg("ltaKey") : ltaApiKey;
   String newOrientation = server.hasArg("orientation") ? server.arg("orientation") : orientationKey;
   if (newOrientation != "bottom") newOrientation = "top";
@@ -393,25 +327,25 @@ void handleSave() {
 
   newLoc.trim();
   newNickname.trim();
-  newPsiRegion.trim();
+  newOwnerName.trim();
+  newDatagovKey.trim();
   newLtaKey.trim();
 
   if (newLoc.length() == 0) newLoc = "Unknown";
+  if (newOwnerName.length() > 24) newOwnerName = newOwnerName.substring(0, 24);
   if (newNickname.length() > 24) newNickname = newNickname.substring(0, 24);
   if (newUnits != "metric" && newUnits != "imperial") newUnits = "metric";
   if (newRegion != "europe" && newRegion != "us") newRegion = "europe";
   newTz = sanitizeTimezoneKey(newTz);
-  newPsiRegion = sanitizePsiRegion(newPsiRegion);
 
   int newSleepMin = server.hasArg("sleepMin") ? server.arg("sleepMin").toInt() : sleepIntervalMin;
   sleepIntervalMin = constrain(newSleepMin, 0, 120);
-  bool newFlashMode = server.hasArg("flashMode");
 
   bool locationChanged =
     (fabsf(newLat - LAT) > 0.0001f) ||
     (fabsf(newLng - LNG) > 0.0001f) ||
     (newLoc != locationName);
-  bool psiRegionChanged = (newPsiRegion != psiRegion);
+  bool datagovKeyChanged = (newDatagovKey != datagovApiKey);
   bool busSettingsChanged = (newLtaKey != ltaApiKey);
   for (int i = 0; i < BUS_MAX_STOPS; i++) {
     if (busStopCodeChanged[i] ||
@@ -422,14 +356,14 @@ void handleSave() {
   }
 
   deviceNickname = newNickname;
+  ownerName = newOwnerName;
   locationName = newLoc;
   LAT = newLat;
   LNG = newLng;
   unitKey = newUnits;
   regionFormatKey = newRegion;
   timezoneKey = newTz;
-  flashModeEnabled = newFlashMode;
-  psiRegion = newPsiRegion;
+  datagovApiKey = newDatagovKey;
   ltaApiKey = newLtaKey;
   for (int i = 0; i < BUS_MAX_STOPS; i++) {
     busStops[i] = newBusStops[i];
@@ -441,28 +375,17 @@ void handleSave() {
       busServicePage[i] = 0;
     }
   }
-  for (int i = 0; i < HOME_SLOT_COUNT; i++) {
-    homeWidgetSlots[i] = newHomeSlots[i];
-  }
-
-  for (int i = 0; i < 6; i++) {
-    String key = String("timer") + String(i);
-    int currentValue = timerPresetMin[i];
-    int nextValue = server.hasArg(key) ? server.arg(key).toInt() : currentValue;
-    timerPresetMin[i] = sanitizeTimerMinutes(nextValue);
-  }
-
   prefs.putString("shellColour", newShellColour);
   prefs.putString("units", unitKey);
   prefs.putString("region", regionFormatKey);
   prefs.putString("tz", timezoneKey);
   prefs.putString("nickname", deviceNickname);
+  prefs.putString("ownerName", ownerName);
   prefs.putString("locname", locationName);
   prefs.putFloat("lat", LAT);
   prefs.putFloat("lng", LNG);
   prefs.putInt("sleepMin", sleepIntervalMin);
-  prefs.putBool("flashMode", flashModeEnabled);
-  prefs.putString("psiRegion", psiRegion);
+  prefs.putString("datagovKey", datagovApiKey);
   prefs.putString("ltaKey", ltaApiKey);
   prefs.putString("orientation", newOrientation);
   for (int i = 0; i < BUS_MAX_STOPS; i++) {
@@ -474,19 +397,10 @@ void handleSave() {
       prefs.putString((String("busRoad") + String(i)).c_str(), "");
     }
   }
-  for (int i = 0; i < HOME_SLOT_COUNT; i++) {
-    String key = String("homeSlot") + String(i);
-    prefs.putString(key.c_str(), homeWidgetKey(homeWidgetSlots[i]));
-  }
-  for (int i = 0; i < 6; i++) {
-    String key = String("timer") + String(i);
-    prefs.putInt(key.c_str(), timerPresetMin[i]);
-  }
-
   applyShellColourByKey(newShellColour);
   applyDeviceTimezoneByKey(timezoneKey);
   applyOrientationByKey(newOrientation); // hot-applies rotation/touch, no reboot needed
-  if (!sleepDimmed && !sleepOff) setBacklight(BL_FULL);
+  if (!sleepDimmed && !sleepOff) setBacklight(brightnessPwm());
 
   pageDirty = true;
   dataDirty = true;
@@ -495,22 +409,22 @@ void handleSave() {
   cacheHomeEmpty1 = "";
   cacheHomeEmpty2 = "";
   cacheFocusTimer = "";
-  cacheTimerMenu = "";
   cacheTimerDone = "";
-  for (int i = 0; i < HOME_SLOT_COUNT; i++) {
-    cacheHomeSlots[i] = "";
-  }
+  clearHomeTileCaches();
 
   lastNowText = "";
   lastHourlyText = "";
   lastPsiText = "";
-  lastPsiLevelText = "";
-  lastUptimeText = "";
+  lastStatusHeaderText = "";
+  lastStatusColourwayText = "";
+  lastStatusSegmentsText = "";
+  lastStatusInfoText = "";
 
   if (locationChanged) resetDataCaches();
-  if (psiRegionChanged) {
+  if (datagovKeyChanged) {
     psiValue = NAN;
     lastPsiFetch = 0;
+    psiBackoff = FetchBackoff();
   }
   if (busSettingsChanged) {
     lastBusPageText = "";

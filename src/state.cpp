@@ -52,6 +52,16 @@ WebServer server(80);
 
 Preferences prefs;
 
+SemaphoreHandle_t dataMutex = nullptr;
+
+void dataLock() {
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+}
+
+void dataUnlock() {
+  if (dataMutex) xSemaphoreGive(dataMutex);
+}
+
 
 // =========================================================
 // SPRITES
@@ -123,19 +133,50 @@ String timezoneKey = "singapore";
 // =========================================================
 String deviceNickname = "";
 
-// Default order matches the "Colourway theme" mockup: Bus, Outdoor, Rain,
-// Timer. Still fully user-configurable via the settings page's Widget
-// Customization panel, same as MakerPulse.
-HomeWidgetType homeWidgetSlots[HOME_SLOT_COUNT] = {
-  HOME_WIDGET_BUS,
-  HOME_WIDGET_OUTDOOR,
-  HOME_WIDGET_RAIN,
-  HOME_WIDGET_TIMER
+String favBusService = "";
+
+bool clockIs24h = true;
+
+void saveClockIs24h(bool is24h) {
+  clockIs24h = is24h;
+  prefs.putBool("clock24h", is24h);
 }
-;
 
 
-String cacheHomeSlots[HOME_SLOT_COUNT];
+String ownerName = "";
+
+int brightnessLevel = 2; // High -- matches the pre-V2.1.0 always-255 behaviour
+
+int brightnessPwm() {
+  switch (brightnessLevel) {
+    case 0: return BRIGHTNESS_LOW;
+    case 1: return BRIGHTNESS_MID;
+    default: return BRIGHTNESS_HIGH;
+  }
+}
+
+void setBrightnessLevel(int level) {
+  brightnessLevel = constrain(level, 0, 2);
+  prefs.putInt("brightness", brightnessLevel);
+  if (!sleepDimmed && !sleepOff) setBacklight(brightnessPwm());
+}
+
+
+String nightModeKey = "off";
+
+unsigned long forcedSyncStartedMs = 0;
+
+void forceSyncAllFeeds() {
+  weatherBackoff.nextRetryAt = 0;
+  psiBackoff.nextRetryAt = 0;
+  sunBackoff.nextRetryAt = 0;
+  for (int i = 0; i < BUS_MAX_STOPS; i++) busBackoff[i].nextRetryAt = 0;
+  forcedSyncStartedMs = millis();
+  pageDirty = true;
+}
+
+
+String cacheHomeTiles[4];
 
 
 Page currentPage = PAGE_HOME;
@@ -168,34 +209,12 @@ String cacheHomeEmpty2 = "";
 
 String cacheFocusTimer = "";
 
-String cacheTimerMenu = "";
-
-String cacheCustomTimer = "";
-
-String cacheBusStopEntry = "";
-
 String cacheTimerDone = "";
 
-String cacheTimerDoneCountdown = "";
-
-String cacheTimerDoneFlash = "";
-
-
-String lastWifiText = "";
-
-String lastSignalText = "";
-
-String lastIpText = "";
-
-String lastUptimeText = "";
 
 String lastUvText = "";
 
-String lastUvLevelText = "";
-
 String lastPsiText = "";
-
-String lastPsiLevelText = "";
 
 String lastNowText = "";
 
@@ -203,67 +222,14 @@ String lastHourlyText = "";
 
 String lastBusPageText = "";
 
-String lastNetworkToggleText = "";
+String lastWeatherHeaderText = "";
 
+String lastBusHeaderText = "";
 
-const char* homeWidgetKey(HomeWidgetType type) {
-  switch (type) {
-    case HOME_WIDGET_WEEK:    return "week";
-    case HOME_WIDGET_TIMER:   return "timer";
-    case HOME_WIDGET_RAIN:    return "rain";
-    case HOME_WIDGET_OUTDOOR: return "outdoor";
-    case HOME_WIDGET_KP:      return "kp";
-    case HOME_WIDGET_UV:      return "uv";
-    case HOME_WIDGET_WIND:    return "wind";
-    case HOME_WIDGET_SUN:     return "sun";
-    case HOME_WIDGET_PSI:     return "psi";
-    case HOME_WIDGET_BUS:     return "bus";
-    default:                  return "week";
-  }
-}
-
-
-const char* homeWidgetLabel(HomeWidgetType type) {
-  switch (type) {
-    case HOME_WIDGET_WEEK:    return "Week";
-    case HOME_WIDGET_TIMER:   return "Timer";
-    case HOME_WIDGET_RAIN:    return "Rain";
-    case HOME_WIDGET_OUTDOOR: return "Outdoor";
-    case HOME_WIDGET_KP:      return "KP index";
-    case HOME_WIDGET_UV:      return "UV index";
-    case HOME_WIDGET_WIND:    return "Wind";
-    case HOME_WIDGET_SUN:     return "Sun event";
-    case HOME_WIDGET_PSI:     return "PSI (haze)";
-    case HOME_WIDGET_BUS:     return "Bus arrival";
-    default:                  return "Week";
-  }
-}
-
-
-HomeWidgetType homeWidgetFromKey(const String& key) {
-  if (key == "week") return HOME_WIDGET_WEEK;
-  if (key == "timer") return HOME_WIDGET_TIMER;
-  if (key == "rain") return HOME_WIDGET_RAIN;
-  if (key == "outdoor") return HOME_WIDGET_OUTDOOR;
-  if (key == "kp") return HOME_WIDGET_KP;
-  if (key == "uv") return HOME_WIDGET_UV;
-  if (key == "wind") return HOME_WIDGET_WIND;
-  if (key == "sun") return HOME_WIDGET_SUN;
-  if (key == "psi") return HOME_WIDGET_PSI;
-  if (key == "bus") return HOME_WIDGET_BUS;
-  return HOME_WIDGET_WEEK;
-}
-
-
-const char* homeSlotLabel(int slot) {
-  switch (slot) {
-    case 0: return "Top left";
-    case 1: return "Top right";
-    case 2: return "Bottom left";
-    case 3: return "Bottom right";
-    default: return "Slot";
-  }
-}
+String lastStatusHeaderText = "";
+String lastStatusColourwayText = "";
+String lastStatusSegmentsText = "";
+String lastStatusInfoText = "";
 
 
 const char* timezonePosixByKey(const String& key) {
@@ -355,51 +321,35 @@ void applyDeviceTimezoneByKey(const String& key) {
 }
 
 
-// V2's Home page uses its own flat "Colourway theme" grid (see config.h's
-// HOME2_* constants) -- only Home reads this function, so updating it here
-// doesn't affect Weather/Bus/Status's still-unchanged layout.
-void getHomeSlotRect(int slot, int& x, int& y, int& w, int& h) {
-  const int xs[HOME_SLOT_COUNT] = {HOME2_MARGIN, HOME2_COL2_X, HOME2_MARGIN, HOME2_COL2_X};
-  const int ys[HOME_SLOT_COUNT] = {HOME2_GRID_Y1, HOME2_GRID_Y1, HOME2_GRID_Y2, HOME2_GRID_Y2};
-  x = xs[slot];
-  y = ys[slot];
-  w = HOME2_COL_W;
-  h = HOME2_GRID_ROW_H;
+// Spec "Home" > "Layout": Bus/Outdoor/Rain/Timer, fixed order, fixed
+// coordinates -- indices 0-3 respectively. No per-user placement.
+void getHomeTileRect(int tileIdx, int& x, int& y, int& w, int& h) {
+  const int xs[4] = {HOME_TILE_BUS_X, HOME_TILE_OUTDOOR_X, HOME_TILE_RAIN_X, HOME_TILE_TIMER_X};
+  const int ys[4] = {HOME_TILE_BUS_Y, HOME_TILE_OUTDOOR_Y, HOME_TILE_RAIN_Y, HOME_TILE_TIMER_Y};
+  x = xs[tileIdx];
+  y = ys[tileIdx];
+  w = HOME_TILE_W;
+  h = HOME_TILE_H;
 }
 
 
-void clearHomeSlotCaches() {
-  for (int i = 0; i < HOME_SLOT_COUNT; i++) {
-    cacheHomeSlots[i] = "";
+void clearHomeTileCaches() {
+  for (int i = 0; i < 4; i++) {
+    cacheHomeTiles[i] = "";
   }
 }
 
 
-// Focus timer
-bool focusMenuOpen = false;
+// Focus timer -- spec "Timer states": idle / running / paused / done.
+FocusTimerState focusTimerState = TIMER_IDLE;
 
-bool focusTimerRunning = false;
-
-bool focusTimerFinished = false;
+int focusDurationIdx = FOCUS_DEFAULT_DURATION_IDX;
 
 unsigned long focusEndMs = 0;
 
-unsigned long focusDurationSec = 0;
+unsigned long focusRemainingSec = (unsigned long)FOCUS_DURATIONS_MIN[FOCUS_DEFAULT_DURATION_IDX] * 60UL;
 
-unsigned long focusRemainingSec = 0;
-
-bool timerDoneDialogOpen = false;
-
-unsigned long timerDoneDialogStartedMs = 0;
-
-bool flashModeEnabled = false;
-
-int timerPresetMin[6] = {1, 5, 10, 15, 25, 30}
-;
-
-bool customTimerEntryOpen = false;
-
-int customTimerMinutes = 20;
+unsigned long focusDoneStartedMs = 0;
 
 bool wifiEnabled = true;
 
@@ -423,13 +373,19 @@ float windDirectionDeg = NAN;
 
 float uvIndex = NAN;
 
+float uvIndexMax = NAN;
+
 float apparentTempC = NAN;
+
+float humidity = NAN;
 
 int weatherCode = -1;
 
 bool weatherIsDay = true;
 
 time_t lastWeatherFetch = 0;
+
+FetchBackoff weatherBackoff;
 
 float hourlyTempC[HOURLY_COUNT];
 
@@ -439,21 +395,31 @@ bool hourlyIsDay[HOURLY_COUNT];
 
 int hourlyHour[HOURLY_COUNT];
 
+int hourlyPrecipProb[HOURLY_COUNT];
+
 int hourlyFilled = 0;
 
+int dailyWeatherCode[DAILY_COUNT];
 
-// KP-index
-float kpIndex = NAN;
+float dailyTempMaxC[DAILY_COUNT];
 
-time_t lastKpFetch = 0;
+int dailyPrecipProbMax[DAILY_COUNT];
+
+int dailyYmd[DAILY_COUNT];
+
+int dailyFilled = 0;
+
+bool weatherShowDaily = false;
 
 
-// PSI (Singapore NEA haze index)
-String psiRegion = "central";
+// PSI (Singapore NEA haze index, national 24-hour reading via data.gov.sg v2)
+String datagovApiKey = "";
 
 float psiValue = NAN;
 
 time_t lastPsiFetch = 0;
+
+FetchBackoff psiBackoff;
 
 
 // Bus arrival (LTA DataMall)
@@ -487,6 +453,8 @@ bool busDataValidByStop[BUS_MAX_STOPS] = {false, false, false}
 time_t lastBusFetchByStop[BUS_MAX_STOPS] = {0, 0, 0}
 ;
 
+FetchBackoff busBackoff[BUS_MAX_STOPS];
+
 int busServicePage[BUS_MAX_STOPS] = {0, 0, 0}
 ;
 
@@ -502,13 +470,6 @@ String busStopDisplayName(int idx) {
 }
 
 
-bool busStopEntryOpen = false;
-
-int busStopEntryTargetIdx = -1;
-
-String busStopEntryDigits = "";
-
-
 // Sunrise / Sunset
 int sunriseMin = -1;
 
@@ -517,6 +478,8 @@ int sunsetMin  = -1;
 int lastSunYmd = -1;
 
 time_t lastSyncTime = 0;
+
+FetchBackoff sunBackoff;
 
 
 bool sleepDimmed = false;
@@ -533,9 +496,32 @@ int sleepIntervalMin = 10;
 
 int sleepOffDelaySec = 60;
 
+
+int touchCalXMin = TOUCH_X_MIN;
+int touchCalXMax = TOUCH_X_MAX;
+int touchCalYMin = TOUCH_Y_MIN;
+int touchCalYMax = TOUCH_Y_MAX;
+
+
+void saveTouchCalibration(int xMin, int xMax, int yMin, int yMax) {
+  touchCalXMin = xMin;
+  touchCalXMax = xMax;
+  touchCalYMin = yMin;
+  touchCalYMax = yMax;
+  prefs.putInt("touchXMin", xMin);
+  prefs.putInt("touchXMax", xMax);
+  prefs.putInt("touchYMin", yMin);
+  prefs.putInt("touchYMax", yMax);
+}
+
 // =========================================================
 // HELPERS
 // =========================================================
+bool timeIsSynced() {
+  return time(nullptr) >= 1700000000;
+}
+
+
 int ymdFromLocal(time_t t) {
   struct tm tmLocal;
   localtime_r(&t, &tmLocal);
@@ -558,91 +544,86 @@ int minutesNowLocal() {
 }
 
 
-String sanitizePsiRegion(const String& region) {
-  if (region == "north" || region == "south" || region == "east" || region == "west" || region == "central") {
-    return region;
+
+
+// Spec "Home" > "Interactions"/"Timer states": tap starts/pauses/resumes;
+// long-press cycles the duration while idle or resets while paused (see
+// cycleFocusDuration()/resetFocusTimerToIdle() below). Done has its own
+// dismiss gesture (any tap, anywhere) rather than reusing this tap handler.
+void startOrToggleFocusTimer() {
+  switch (focusTimerState) {
+    case TIMER_IDLE: {
+      unsigned long durationSec = (unsigned long)FOCUS_DURATIONS_MIN[focusDurationIdx] * 60UL;
+      focusRemainingSec = durationSec;
+      focusEndMs = millis() + durationSec * 1000UL;
+      focusTimerState = TIMER_RUNNING;
+      break;
+    }
+    case TIMER_RUNNING:
+      focusTimerState = TIMER_PAUSED; // freezes focusRemainingSec as-is
+      break;
+    case TIMER_PAUSED:
+      focusEndMs = millis() + focusRemainingSec * 1000UL;
+      focusTimerState = TIMER_RUNNING;
+      break;
+    case TIMER_DONE:
+      break;
   }
-  return "central";
-}
-
-
-int sanitizeTimerMinutes(int value) {
-  return constrain(value, 1, 180);
-}
-
-
-void resetFocusTimer() {
-  focusTimerRunning = false;
-  focusTimerFinished = false;
-  focusMenuOpen = false;
-  customTimerEntryOpen = false;
-  timerDoneDialogOpen = false;
-  focusEndMs = 0;
-  focusDurationSec = 0;
-  focusRemainingSec = 0;
   cacheFocusTimer = "";
-  clearHomeSlotCaches();
-  cacheTimerMenu = "";
-  cacheCustomTimer = "";
-  cacheTimerDone = "";
-  cacheTimerDoneCountdown = "";
-  cacheTimerDoneFlash = "";
-}
-
-
-void startFocusTimer(unsigned long minutes) {
-  focusDurationSec = minutes * 60UL;
-  focusRemainingSec = focusDurationSec;
-  focusEndMs = millis() + (focusDurationSec * 1000UL);
-  focusTimerRunning = true;
-  focusTimerFinished = false;
-  focusMenuOpen = false;
-  customTimerEntryOpen = false;
-  timerDoneDialogOpen = false;
-  cacheFocusTimer = "";
-  clearHomeSlotCaches();
-  cacheTimerMenu = "";
-  cacheCustomTimer = "";
-  cacheTimerDone = "";
-  cacheTimerDoneCountdown = "";
-  cacheTimerDoneFlash = "";
-}
-
-
-void dismissTimerDoneDialog() {
-  if (!timerDoneDialogOpen) return;
-  timerDoneDialogOpen = false;
-  timerDoneDialogStartedMs = 0;
-  cacheTimerDone = "";
-  cacheTimerDoneCountdown = "";
-  cacheTimerDoneFlash = "";
-  if (!sleepDimmed && !sleepOff) setBacklight(BL_FULL);
+  clearHomeTileCaches();
   pageDirty = true;
 }
 
 
-void openTimerDoneDialog() {
-  timerDoneDialogOpen = true;
-  timerDoneDialogStartedMs = millis();
+void cycleFocusDuration() {
+  if (focusTimerState != TIMER_IDLE) return;
+  focusDurationIdx = (focusDurationIdx + 1) % FOCUS_DURATIONS_COUNT;
+  focusRemainingSec = (unsigned long)FOCUS_DURATIONS_MIN[focusDurationIdx] * 60UL;
+  prefs.putInt("focusDurIdx", focusDurationIdx);
+  cacheFocusTimer = "";
+  clearHomeTileCaches();
+  pageDirty = true;
+}
+
+
+void resetFocusTimerToIdle() {
+  if (focusTimerState != TIMER_PAUSED) return;
+  focusTimerState = TIMER_IDLE;
+  focusRemainingSec = (unsigned long)FOCUS_DURATIONS_MIN[focusDurationIdx] * 60UL;
+  focusEndMs = 0;
+  cacheFocusTimer = "";
+  clearHomeTileCaches();
+  pageDirty = true;
+}
+
+
+void dismissTimerDone() {
+  if (focusTimerState != TIMER_DONE) return;
+  focusTimerState = TIMER_IDLE;
+  focusRemainingSec = (unsigned long)FOCUS_DURATIONS_MIN[focusDurationIdx] * 60UL;
+  focusDoneStartedMs = 0;
   cacheTimerDone = "";
-  cacheTimerDoneCountdown = "";
-  wakeDisplay();
+  cacheFocusTimer = "";
+  clearHomeTileCaches();
+  if (!sleepDimmed && !sleepOff) setBacklight(brightnessPwm());
+  pageDirty = true;
 }
 
 
 void updateFocusTimerState() {
-  if (!focusTimerRunning) return;
+  if (focusTimerState != TIMER_RUNNING) return;
 
   unsigned long now = millis();
   if ((long)(focusEndMs - now) <= 0) {
     focusRemainingSec = 0;
-    focusTimerRunning = false;
-    focusTimerFinished = true;
-    focusMenuOpen = false;
+    focusTimerState = TIMER_DONE;
+    focusDoneStartedMs = now;
     cacheFocusTimer = "";
-    clearHomeSlotCaches();
-    cacheTimerMenu = "";
-    openTimerDoneDialog();
+    clearHomeTileCaches();
+    cacheTimerDone = "";
+    wakeDisplay();
+    setBacklight(BL_FULL); // spec: "Backlight goes to High"
+    pageDirty = true;
     return;
   }
 
@@ -651,116 +632,145 @@ void updateFocusTimerState() {
   if (nextRemainingSec != focusRemainingSec) {
     focusRemainingSec = nextRemainingSec;
     cacheFocusTimer = "";
-    clearHomeSlotCaches();
+    clearHomeTileCaches();
   }
 }
 
 
-void updateTimerDoneDialogState() {
-  if (!timerDoneDialogOpen) return;
-  if (millis() - timerDoneDialogStartedMs >= TIMER_DONE_DIALOG_MS) {
-    dismissTimerDoneDialog();
+void updateTimerDoneAutoDismiss() {
+  if (focusTimerState != TIMER_DONE) return;
+  if (millis() - focusDoneStartedMs >= TIMER_DONE_DIALOG_MS) {
+    dismissTimerDone();
   }
 }
 
 
 // =========================================================
-// SHELL COLOUR (see CONTEXT.md's "Shell colour" entry)
+// COLOURWAY (see docs/MAKERPULSE_V2_SPEC.md "Colour roles"/"Colourways",
+// and CONTEXT.md's "Colourway" entry)
 // =========================================================
-// The 8 fixed preset colours, one per physical 3D-printed case -- see
-// "MakerPulse Colours.pdf" and docs/adr/0002-fixed-shell-colour-palette.md
-// for where these came from and how BG/PANEL/STROKE/ACCENT were derived
-// from each case's sampled body color (same hue family, same formula).
-// Gone through two corrections already, both found by actually computing
-// numbers rather than eyeballing hex codes:
-//   1. The first version's tints were pale enough that several rounded to
-//      the *same* 16-bit RGB565 pixel value once quantized -- switching
-//      shells visibly changed nothing. Two shells (Muted White, Muted
-//      Green) have such low source saturation that preserving their "hue"
-//      produced an unstable, near-arbitrary tint that collided with
-//      unrelated shells; those two are derived as neutral
-//      (zero-saturation) tints instead.
-//   2. That fix left every preset still reading as "barely tinted
-//      off-white" -- each one's own color wasn't obvious. Darkened and
-//      re-saturated via a grid search over (background lightness,
-//      saturation cap, dim-text grey) for the darkest/most-saturated
-//      combination that still clears WCAG AA with a real margin (>=5:1,
-//      not just the 4.5:1 minimum) on every pairing actually drawn on
-//      screen: ink/dim vs background, ink vs panel, and
-//      background-colored text vs accent (the timer-alarm flash).
-// Text (ink) and dim are intentionally hue-NEUTRAL constants shared by
-// all 8 -- not derived per shell -- so every preset gets the same
-// contrast margin instead of needing 8 separate manual checks.
-struct ShellColourPalette {
+// Five roles per palette -- bg, ink, muted, rule, accent -- values are the
+// spec's own pre-computed RGB565 hex, used verbatim (no runtime derivation,
+// no WCAG math here: the spec states all pairs already clear AA 4.5:1).
+// This supersedes the 8 MakerPulse-filament "shell colour" presets (see
+// docs/adr/0002, now superseded by docs/adr/0003) -- same mechanism (one
+// Preferences key, one firmware image), different, spec-authored palette.
+// Charcoal doubles as the night-mode palette (applyNightOverride() in
+// display.cpp, Phase 7). COL_PANEL/COL_PANEL_ALT are legacy fields kept
+// equal to bg/rule only so Weather/Bus/Status (not yet rewritten to the
+// "no boxes" spec) still compile and look reasonable -- they go away once
+// those pages are redone.
+struct Colourway {
   const char* key;
   const char* label;
-  uint16_t swatch; // raw case color, shown as the settings-page swatch
-  uint16_t bg, panel, stroke, accent;
+  uint16_t caseColor; // physical case swatch shown on Status, not drawn elsewhere
+  uint16_t bg, ink, muted, rule, accent;
 };
 
-static const ShellColourPalette SHELL_COLOURS[] = {
-  { "muted-white",      "Muted White",      0xD679, 0xC618, 0xAD75, 0x8430, 0x49A4 },
-  { "pastel-ice",       "Pastel Ice",       0x9DD7, 0xB659, 0x9DB7, 0x6493, 0x128B },
-  { "muted-blue",       "Muted Blue",       0x6C54, 0xADD9, 0x9537, 0x5BD3, 0x11AB },
-  { "army-blue",        "Army Blue",        0x324D, 0x9D79, 0x7CB7, 0x4B73, 0x118B },
-  { "muted-green",      "Muted Green",      0x5B2B, 0xB5B6, 0xA514, 0x7BCF, 0x3244 },
-  { "army-red",         "Army Red",         0x8903, 0xCCF3, 0xBC0F, 0xA248, 0x58A2 },
-  { "pastel-peach",     "Pastel Peach",     0xF674, 0xD616, 0xCD72, 0xB42A, 0x61C1 },
-  { "mandarin-orange",  "Mandarin Orange",  0xE3C7, 0xCDB4, 0xC4F1, 0xB389, 0x6162 },
+static const Colourway COLOURWAYS[] = {
+  { "sage",     "Sage",     0xA591, 0xDF3A, 0x1943, 0x5329, 0xBE35, 0x3B46 },
+  { "ivory",    "Ivory",    0xEF1A, 0xF79D, 0x18E3, 0x62EA, 0xDE97, 0xBA01 },
+  { "sky",      "Sky",      0x95FC, 0xE77E, 0x1127, 0x4B0E, 0xBE9C, 0x1B34 },
+  { "peach",    "Peach",    0xF531, 0xFF5C, 0x38A2, 0x7A68, 0xEE36, 0xB9E1 },
+  { "lilac",    "Lilac",    0xB53B, 0xEF5E, 0x20C7, 0x5AAF, 0xD65D, 0x59B9 },
+  { "charcoal", "Charcoal", 0x2965, 0x18E3, 0xF79D, 0xAD54, 0x39C7, 0xF5A0 },
 };
-static const int SHELL_COLOUR_COUNT = sizeof(SHELL_COLOURS) / sizeof(SHELL_COLOURS[0]);
-
-// Hue-neutral constant ink/dim, shared by every shell colour. Darkened
-// along with the backgrounds below (see docs/adr/0002) -- re-verified at
-// >=5:1 contrast (a safety buffer above the 4.5:1 AA minimum, since this
-// is right where backgrounds got meaningfully more saturated/darker) on
-// every pairing actually used on screen: ink/dim vs background, ink vs
-// panel, and background-colored text vs accent (the timer-alarm flash).
-static const uint16_t SHELL_INK = 0x10A2;
-static const uint16_t SHELL_DIM = 0x31A6;
+static const int COLOURWAY_COUNT = sizeof(COLOURWAYS) / sizeof(COLOURWAYS[0]);
+static const int CHARCOAL_INDEX = 5; // COLOURWAYS[5] -- also the night-mode palette
 
 
 bool isValidShellColourKey(const String& key) {
-  for (int i = 0; i < SHELL_COLOUR_COUNT; i++) {
-    if (key == SHELL_COLOURS[i].key) return true;
+  for (int i = 0; i < COLOURWAY_COUNT; i++) {
+    if (key == COLOURWAYS[i].key) return true;
   }
   return false;
 }
 
 
 const char* shellColourLabel(const String& key) {
-  for (int i = 0; i < SHELL_COLOUR_COUNT; i++) {
-    if (key == SHELL_COLOURS[i].key) return SHELL_COLOURS[i].label;
+  for (int i = 0; i < COLOURWAY_COUNT; i++) {
+    if (key == COLOURWAYS[i].key) return COLOURWAYS[i].label;
   }
-  return SHELL_COLOURS[0].label;
+  return COLOURWAYS[0].label;
 }
 
 
-int shellColourCount() { return SHELL_COLOUR_COUNT; }
+int shellColourCount() { return COLOURWAY_COUNT; }
 
 
 // For the settings page's swatch row -- iterate idx 0..shellColourCount()-1.
 void shellColourAt(int idx, const char** key, const char** label, uint16_t* swatch) {
-  if (idx < 0 || idx >= SHELL_COLOUR_COUNT) idx = 0;
-  *key = SHELL_COLOURS[idx].key;
-  *label = SHELL_COLOURS[idx].label;
-  *swatch = SHELL_COLOURS[idx].swatch;
+  if (idx < 0 || idx >= COLOURWAY_COUNT) idx = 0;
+  *key = COLOURWAYS[idx].key;
+  *label = COLOURWAYS[idx].label;
+  *swatch = COLOURWAYS[idx].caseColor;
+}
+
+
+// For #define COLOUR_TEST -- all 5 roles, not just the case swatch.
+void colourwayRolesAt(int idx, uint16_t* bg, uint16_t* ink, uint16_t* muted, uint16_t* rule, uint16_t* accent) {
+  if (idx < 0 || idx >= COLOURWAY_COUNT) idx = 0;
+  *bg = COLOURWAYS[idx].bg;
+  *ink = COLOURWAYS[idx].ink;
+  *muted = COLOURWAYS[idx].muted;
+  *rule = COLOURWAYS[idx].rule;
+  *accent = COLOURWAYS[idx].accent;
+}
+
+
+static void applyColourway(const Colourway& p) {
+  COL_BG = p.bg;
+  COL_TEXT = p.ink;
+  COL_DIM = p.muted;
+  COL_STROKE = p.rule;
+  COL_ACCENT = p.accent;
+  COL_PANEL = p.bg;     // legacy -- see comment above the struct
+  COL_PANEL_ALT = p.rule;
 }
 
 
 void applyShellColourByKey(const String& key) {
-  const ShellColourPalette* p = &SHELL_COLOURS[0];
-  for (int i = 0; i < SHELL_COLOUR_COUNT; i++) {
-    if (key == SHELL_COLOURS[i].key) { p = &SHELL_COLOURS[i]; break; }
+  const Colourway* p = &COLOURWAYS[0];
+  for (int i = 0; i < COLOURWAY_COUNT; i++) {
+    if (key == COLOURWAYS[i].key) { p = &COLOURWAYS[i]; break; }
   }
   shellColourKey = p->key;
-  COL_BG = p->bg;
-  COL_PANEL = p->panel;
-  COL_PANEL_ALT = p->panel;
-  COL_STROKE = p->stroke;
-  COL_ACCENT = p->accent;
-  COL_TEXT = SHELL_INK;
-  COL_DIM = SHELL_DIM;
+  applyColourway(*p);
+}
+
+
+// Spec "Status" > "Night mode Auto": swaps the live palette to Charcoal +
+// Low brightness between sunset and sunrise (19:00-07:00 fallback if sun
+// times aren't known yet) without touching shellColourKey itself -- the
+// chosen colourway reapplies automatically at sunrise, and the Status
+// page's own swatch selection still reflects what the user actually
+// picked, not whatever's visually active overnight. Called once a second
+// from main.cpp; the static guards against redundant reapplication (and
+// the backlight/pageDirty churn that would cause) every tick.
+void applyNightOverride() {
+  static bool nightCurrentlyActive = false;
+
+  bool nightActive = false;
+  if (nightModeKey == "auto") {
+    int nowMin = minutesNowLocal();
+    int startMin = (sunriseMin >= 0 && sunsetMin >= 0) ? sunsetMin : (19 * 60);
+    int endMin   = (sunriseMin >= 0 && sunsetMin >= 0) ? sunriseMin : (7 * 60);
+    nightActive = (startMin > endMin)
+                    ? (nowMin >= startMin || nowMin < endMin)  // wraps midnight
+                    : (nowMin >= startMin && nowMin < endMin);
+  }
+
+  if (nightActive == nightCurrentlyActive) return;
+  nightCurrentlyActive = nightActive;
+
+  if (nightActive) {
+    applyColourway(COLOURWAYS[CHARCOAL_INDEX]);
+    if (!sleepDimmed && !sleepOff) setBacklight(BRIGHTNESS_LOW);
+  } else {
+    applyShellColourByKey(shellColourKey);
+    if (!sleepDimmed && !sleepOff) setBacklight(brightnessPwm());
+  }
+  pageDirty = true;
 }
 
 
@@ -796,11 +806,11 @@ void loadStoredSettings() {
   storedWifiPass    = prefs.getString("wifiPass", "");
   deviceProvisioned = storedWifiSsid.length() > 0;
 
-  // One of the 8 fixed shell colours -- see CONTEXT.md's "Shell colour"
+  // One of the spec's 6 fixed colourways -- see CONTEXT.md's "Colourway"
   // entry. No custom picker in V2; an invalid/missing key falls back to
-  // the first preset.
-  String shellColour = prefs.getString("shellColour", "muted-white");
-  if (!isValidShellColourKey(shellColour)) shellColour = "muted-white";
+  // the first preset (Sage, the spec's own default).
+  String shellColour = prefs.getString("shellColour", "sage");
+  if (!isValidShellColourKey(shellColour)) shellColour = "sage";
 
   deviceNickname    = prefs.getString("nickname", "");
   locationName     = prefs.getString("locname", "Singapore");
@@ -810,12 +820,25 @@ void loadStoredSettings() {
   unitKey          = prefs.getString("units", "metric");
   regionFormatKey  = prefs.getString("region", "europe");
   timezoneKey      = sanitizeTimezoneKey(prefs.getString("tz", "singapore"));
-  flashModeEnabled = prefs.getBool("flashMode", false);
+  clockIs24h       = prefs.getBool("clock24h", true);
+  ownerName        = prefs.getString("ownerName", "");
+  brightnessLevel  = constrain(prefs.getInt("brightness", 2), 0, 2);
+  nightModeKey     = prefs.getString("nightMode", "off");
+  if (nightModeKey != "auto") nightModeKey = "off";
+  favBusService    = prefs.getString("favBusSvc", "");
+  focusDurationIdx = prefs.getInt("focusDurIdx", FOCUS_DEFAULT_DURATION_IDX);
+  if (focusDurationIdx < 0 || focusDurationIdx >= FOCUS_DURATIONS_COUNT) focusDurationIdx = FOCUS_DEFAULT_DURATION_IDX;
+  focusRemainingSec = (unsigned long)FOCUS_DURATIONS_MIN[focusDurationIdx] * 60UL;
   wifiEnabled      = prefs.getBool("wifiEnabled", true);
-  psiRegion        = sanitizePsiRegion(prefs.getString("psiRegion", "central"));
+  datagovApiKey    = prefs.getString("datagovKey", "");
   ltaApiKey        = prefs.getString("ltaKey", "");
   orientationKey   = prefs.getString("orientation", "top");
   if (orientationKey != "bottom") orientationKey = "top";
+
+  touchCalXMin = prefs.getInt("touchXMin", TOUCH_X_MIN);
+  touchCalXMax = prefs.getInt("touchXMax", TOUCH_X_MAX);
+  touchCalYMin = prefs.getInt("touchYMin", TOUCH_Y_MIN);
+  touchCalYMax = prefs.getInt("touchYMax", TOUCH_Y_MAX);
 
   String legacyBusStop = prefs.getString("busStop", "");
   String legacyBusSvc  = prefs.getString("busSvc", "");
@@ -835,16 +858,6 @@ void loadStoredSettings() {
     busStopNames[i].valid = busStopNames[i].description.length() > 0 || busStopNames[i].roadName.length() > 0;
   }
 
-  for (int i = 0; i < HOME_SLOT_COUNT; i++) {
-    String key = String("homeSlot") + String(i);
-    homeWidgetSlots[i] = homeWidgetFromKey(prefs.getString(key.c_str(), homeWidgetKey(homeWidgetSlots[i])));
-  }
-
-  for (int i = 0; i < 6; i++) {
-    String key = String("timer") + String(i);
-    timerPresetMin[i] = sanitizeTimerMinutes(prefs.getInt(key.c_str(), timerPresetMin[i]));
-  }
-
   if (unitKey != "metric" && unitKey != "imperial") unitKey = "metric";
   if (regionFormatKey != "europe" && regionFormatKey != "us") regionFormatKey = "europe";
   deviceNickname.trim();
@@ -858,12 +871,10 @@ void resetDataCaches() {
   precipMm = NAN;
   windSpeedMs = NAN;
   windDirectionDeg = NAN;
-  kpIndex = NAN;
   sunriseMin = -1;
   sunsetMin = -1;
   lastSunYmd = -1;
   lastWeatherFetch = 0;
-  lastKpFetch = 0;
   dataDirty = true;
   pageDirty = true;
 }

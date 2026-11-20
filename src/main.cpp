@@ -14,11 +14,9 @@
 // SETUP / LOOP
 // =========================================================
 void waitForNtpTime() {
-  time_t now = time(nullptr);
   unsigned long t0 = millis();
-  while (now < 1700000000 && millis() - t0 < 10000) {
+  while (!timeIsSynced() && millis() - t0 < 10000) {
     delay(200);
-    now = time(nullptr);
   }
 }
 
@@ -46,11 +44,10 @@ void finishBootAfterWifi() {
   );
   waitForNtpTime();
 
-  ensureSunTimesForToday();
-  ensureWeather();
-  ensureKpIndex();
-  ensurePsi();
-  ensureBusArrival();
+  // Fetching is the net task's job (startNetTask(), already running on
+  // core 0) -- it picks these up on its next pass now that NTP/WiFi are
+  // ready. The first page draw below may briefly show placeholder values
+  // until that pass completes (within ~1s).
 
   setupWebServer();
 
@@ -106,8 +103,11 @@ void setup() {
   digitalWrite(27, HIGH);
 
   loadStoredSettings();
-  setBacklight(BL_FULL);
+  setBacklight(brightnessPwm());
   lastInteractionMs = millis();
+
+  dataMutex = xSemaphoreCreateMutex();
+  startNetTask();
 
   delay(200);
 
@@ -120,6 +120,11 @@ void setup() {
   digitalWrite(TOUCH_CS, HIGH);
   ts.begin(touchSPI);
   applyOrientationByKey(orientationKey); // tft/ts are ready now; see state.cpp
+
+#ifdef COLOUR_TEST
+  drawColourTestScreen();
+  return; // static debug screen -- no WiFi, no touch, no normal boot
+#endif
 
   if (!deviceProvisioned) {
     drawSetupScreen();
@@ -144,17 +149,41 @@ void loop() {
     return; // Improv is the only thing running; TFT just shows the setup screen
   }
 
+  if (touchCalibrationActive()) {
+    updateTouchCalibration();
+    delay(10);
+    return; // owns all touch input until the two-point routine finishes
+  }
+
   server.handleClient();
   updateWiFiConnectionState();
   updateFocusTimerState();
-  updateTimerDoneDialogState();
+  updateTimerDoneAutoDismiss();
   handleAutoSleep();
 
-  int tx = 0, ty = 0;
-  if (touchNewPress(tx, ty)) {
+  // Spec "Touch and gestures": tap vs long-press, resolved by
+  // pollTouchEvent(). justPressed fires on the raw down-edge, before a tap
+  // or long-press has resolved -- used here for "wake swallows the first
+  // touch," same swallow rule as before (full-off or auto-dimmed swallows;
+  // manually-dimmed does not, taps still work while dim on purpose).
+  TouchEvt evt;
+  bool justPressed = false;
+  bool haveEvt = pollTouchEvent(evt, justPressed);
+  static bool swallowPress = false;
+
+  // Spec "Status" > "Interactions": "STATUS header: Hold 5s -> touch
+  // calibration." Independent of the 600ms long-press used everywhere
+  // else (handled via touchHoldMsInRect(), not pollTouchEvent()).
+  if (currentPage == PAGE_STATUS && touchHoldMsInRect(0, 0, SCREEN_W, 54) >= (unsigned long)V2_CALIBRATION_HOLD_MS) {
+    startTouchCalibration();
+  }
+
+  if (justPressed) {
+    swallowPress = false;
     lastInteractionMs = millis();
 
     if (sleepOff) {
+      swallowPress = true;
       if (manualDimMode) {
         sleepOff = false;
         sleepDimmed = true;
@@ -163,54 +192,38 @@ void loop() {
       } else {
         wakeDisplay();
       }
-      return;
+    } else if (sleepDimmed && !manualDimMode) {
+      swallowPress = true;
+      wakeDisplay();
     }
+  }
 
-    if (handleTimerDoneDialogTouch(tx, ty)) {
-      return;
-    }
+  if (haveEvt && !swallowPress) {
+    int tx = evt.x, ty = evt.y;
 
-    if (tx >= SCREEN_W - 36 && ty <= TOPBAR_H) {
-      toggleSleepMode();
-      pageDirty = true;
-    } else {
-      if (sleepDimmed) {
-        if (!manualDimMode) {
-          wakeDisplay();
-        } else {
-          if (!handleHomeTouch(tx, ty) && !handleStatusTouch(tx, ty) && !handleBusTouch(tx, ty)) {
-            handleNavTouch(tx, ty);
-          }
-        }
-      } else {
-        if (!handleHomeTouch(tx, ty) && !handleStatusTouch(tx, ty) && !handleBusTouch(tx, ty)) {
+    if (evt.type == TOUCH_TAP) {
+      if (!handleTimerDoneDialogTouch(tx, ty)) {
+        if (tx >= SCREEN_W - 36 && ty <= TOPBAR_H) {
+          toggleSleepMode();
+          pageDirty = true;
+        } else if (!handleHomeTouch(tx, ty) && !handleWeatherTouch(tx, ty) && !handleStatusTouch(tx, ty) && !handleBusTouch(tx, ty)) {
           handleNavTouch(tx, ty);
         }
       }
+    } else if (evt.type == TOUCH_LONG_PRESS) {
+      // Phase 7: STATUS header 5s hold runs touch calibration via
+      // touchHoldMsInRect(), independent of this 600ms event -- a no-op
+      // here for now, not a missed case.
+      if (!handleHomeLongPress(tx, ty)) handleBusLongPress(tx, ty);
     }
   }
 
-  if (millis() - lastDataTick >= DATA_TICK_MS) {
-    lastDataTick = millis();
-    ensureSunTimesForToday();
-    ensureWeather();
-    ensureKpIndex();
-    ensurePsi();
-    ensureBusArrival();
-  }
-
   if (pageDirty || lastDrawnPage != currentPage) {
-    bool anyOverlayOpen = focusMenuOpen || customTimerEntryOpen || timerDoneDialogOpen || busStopEntryOpen;
+    bool anyOverlayOpen = (focusTimerState == TIMER_DONE);
     if (lastDrawnPage != currentPage || !anyOverlayOpen) {
       drawCurrentPageFull();
-    } else if (timerDoneDialogOpen) {
+    } else if (focusTimerState == TIMER_DONE) {
       drawTimerDoneOverlay(true);
-    } else if (customTimerEntryOpen && currentPage == PAGE_HOME) {
-      drawCustomTimerEntryOverlay(true);
-    } else if (focusMenuOpen && currentPage == PAGE_HOME) {
-      drawFocusMenuOverlay(true);
-    } else if (busStopEntryOpen && currentPage == PAGE_BUS) {
-      drawBusStopEntryOverlay(true);
     }
     updateCurrentPageDynamic();
     pageDirty = false;
@@ -219,6 +232,7 @@ void loop() {
 
   if (millis() - lastClockTick >= CLOCK_TICK_MS) {
     lastClockTick = millis();
+    applyNightOverride();
     updateCurrentPageDynamic();
     dataDirty = false;
   }

@@ -28,6 +28,16 @@ extern Preferences prefs;
 extern TFT_eSprite sprClock;
 extern TFT_eSprite sprSmall;
 
+// Guards every shared-feed variable below (weather/PSI/bus/sun-time state)
+// that the net task (network.cpp, core 0) writes and the UI (main loop,
+// core 1) reads. Fetch functions hold it only around the brief
+// assignment-of-parsed-results step, never across the HTTPS call itself --
+// that's the whole point of the dedicated task. Initialized once in
+// setup() before startNetTask() is called.
+extern SemaphoreHandle_t dataMutex;
+void dataLock();
+void dataUnlock();
+
 extern float LAT;
 extern float LNG;
 extern String locationName;
@@ -54,8 +64,45 @@ extern int rotationValue;
 extern bool touchFlipX, touchFlipY;
 
 extern String deviceNickname;
-extern HomeWidgetType homeWidgetSlots[];
-extern String cacheHomeSlots[];
+
+// Spec "Status" > "Layout": "Owner | Made by Aisha (OWNER_NAME, the name
+// on the student's Name Cap)". Distinct from deviceNickname (which names
+// the device itself, shown as the Status "Product name" via homeTitleText()
+// -- actually just "MakerPulse" per the spec table, deviceNickname is a
+// pre-V2.1.0 field kept for the settings page but no longer drawn on
+// Status as the headline). Empty hides the "Made by" row entirely.
+extern String ownerName;
+
+// Spec "Status" > "Interactions": "Brightness option: Set backlight: Low
+// 40, Mid 140, High 255 (8-bit PWM), save." 0=Low, 1=Mid, 2=High.
+extern int brightnessLevel;
+int brightnessPwm();
+void setBrightnessLevel(int level);
+
+// Spec "Status" > "Night mode Auto": "between today's sunset and the next
+// sunrise, render with the Charcoal palette and Low brightness... The
+// chosen colourway returns at sunrise. If sun times are unknown, use
+// 19:00-07:00." nightModeKey is "off" or "auto"; applyNightOverride()
+// checks the clock each second (main.cpp) and swaps the live palette in
+// and out without touching the user's actual shellColourKey choice.
+extern String nightModeKey;
+void applyNightOverride();
+
+// Spec "Status" > "Interactions": "Synced row: Force-refresh all feeds
+// now; row reads 'Syncing...' until done." 0 = not syncing.
+extern unsigned long forcedSyncStartedMs;
+void forceSyncAllFeeds();
+
+// Spec "Home" > "Interactions": favourite bus service, set by long-pressing
+// its row on the Bus page (Phase 6); the Home Bus tile reads the same
+// value. Empty until the user has favourited one.
+extern String favBusService;
+
+// Spec "Home" > "Interactions": "Clock: long-press toggles 12h/24h
+// (saved)". Independent of regionFormatKey (date format), which is a
+// separate pre-existing setting.
+extern bool clockIs24h;
+void saveClockIs24h(bool is24h);
 
 extern Page currentPage;
 extern Page lastDrawnPage;
@@ -65,51 +112,67 @@ extern bool pageDirty;
 extern bool dataDirty;
 
 extern String cacheClock, cacheTemp, cacheRain, cacheWeek, cacheHomeEmpty1, cacheHomeEmpty2;
-extern String cacheFocusTimer, cacheTimerMenu, cacheCustomTimer, cacheBusStopEntry;
-extern String cacheTimerDone, cacheTimerDoneCountdown, cacheTimerDoneFlash;
+extern String cacheFocusTimer;
+extern String cacheHomeTiles[4];
+extern String cacheTimerDone;
 
-extern String lastWifiText, lastSignalText, lastIpText, lastUptimeText;
-extern String lastUvText, lastUvLevelText, lastPsiText, lastPsiLevelText;
-extern String lastNowText, lastHourlyText, lastBusPageText, lastNetworkToggleText;
+extern String lastUvText, lastPsiText;
+extern String lastNowText, lastHourlyText, lastBusPageText;
+extern String lastWeatherHeaderText;
+extern String lastBusHeaderText;
+extern String lastStatusHeaderText, lastStatusColourwayText, lastStatusSegmentsText, lastStatusInfoText;
 
-const char* homeWidgetKey(HomeWidgetType type);
-const char* homeWidgetLabel(HomeWidgetType type);
-HomeWidgetType homeWidgetFromKey(const String& key);
-const char* homeSlotLabel(int slot);
 const char* timezonePosixByKey(const String& key);
 const char* timezoneLabelByKey(const String& key);
 String sanitizeTimezoneKey(const String& key);
 void applyDeviceTimezoneByKey(const String& key);
-void getHomeSlotRect(int slot, int& x, int& y, int& w, int& h);
-void clearHomeSlotCaches();
+void getHomeTileRect(int tileIdx, int& x, int& y, int& w, int& h);
+void clearHomeTileCaches();
 
-extern bool focusMenuOpen, focusTimerRunning, focusTimerFinished;
-extern unsigned long focusEndMs, focusDurationSec, focusRemainingSec;
-extern bool timerDoneDialogOpen;
-extern unsigned long timerDoneDialogStartedMs;
-extern bool flashModeEnabled;
-extern int timerPresetMin[6];
-extern bool customTimerEntryOpen;
-extern int customTimerMinutes;
+// Spec "Timer states": idle / running / paused / done. focusDurationIdx
+// indexes FOCUS_DURATIONS_MIN (config.h) -- the chosen duration, persisted
+// in NVS, cycled via long-press while idle. focusRemainingSec is the live
+// countdown while running or paused; focusEndMs is only meaningful while
+// running (millis() target for when it hits zero).
+extern FocusTimerState focusTimerState;
+extern int focusDurationIdx;
+extern unsigned long focusEndMs, focusRemainingSec;
+extern unsigned long focusDoneStartedMs;
 extern bool wifiEnabled, wifiConnectInProgress;
 extern unsigned long wifiConnectStartedMs;
 
-extern float tempC, tempMinC, tempMaxC, precipMm, windSpeedMs, windDirectionDeg, uvIndex, apparentTempC;
+extern float tempC, tempMinC, tempMaxC, precipMm, windSpeedMs, windDirectionDeg, uvIndex, uvIndexMax, apparentTempC, humidity;
 extern int weatherCode;
 extern bool weatherIsDay;
 extern time_t lastWeatherFetch;
+extern FetchBackoff weatherBackoff;
 extern float hourlyTempC[HOURLY_COUNT];
 extern int hourlyCode[HOURLY_COUNT];
 extern bool hourlyIsDay[HOURLY_COUNT];
 extern int hourlyHour[HOURLY_COUNT];
+extern int hourlyPrecipProb[HOURLY_COUNT];
 extern int hourlyFilled;
 
-extern float kpIndex;
-extern time_t lastKpFetch;
+// Spec "Weather" > "Tap the strip: 5-day view" -- index 0 is today (shares
+// temperature_2m_max/min with the tempMaxC/tempMinC fields above), indices
+// 1..5 are the five days the toggle view shows.
+extern int dailyWeatherCode[DAILY_COUNT];
+extern float dailyTempMaxC[DAILY_COUNT];
+extern int dailyPrecipProbMax[DAILY_COUNT];
+extern int dailyYmd[DAILY_COUNT];
+extern int dailyFilled;
 
-extern String psiRegion;
+// Page-local UI toggle, not persisted -- "resets to hourly when you leave
+// the page" (main.cpp's handleNavTouch() clears it on any page change).
+extern bool weatherShowDaily;
+
+// National 24-hour PSI via data.gov.sg v2 (spec "Data sources" table) --
+// no region selection anymore, the v2 real-time API returns one national
+// reading. datagovApiKey is the required x-api-key header value.
+extern String datagovApiKey;
 extern float psiValue;
 extern time_t lastPsiFetch;
+extern FetchBackoff psiBackoff;
 
 extern String ltaApiKey;
 String effectiveLtaApiKey();
@@ -121,38 +184,50 @@ extern BusServiceInfo busServicesByStop[BUS_MAX_STOPS][BUS_MAX_SERVICES];
 extern int busServiceCountByStop[BUS_MAX_STOPS];
 extern bool busDataValidByStop[BUS_MAX_STOPS];
 extern time_t lastBusFetchByStop[BUS_MAX_STOPS];
+extern FetchBackoff busBackoff[BUS_MAX_STOPS];
 extern int busServicePage[BUS_MAX_STOPS];
 String busStopDisplayName(int idx);
 
-extern bool busStopEntryOpen;
-extern int busStopEntryTargetIdx;
-extern String busStopEntryDigits;
-
 extern int sunriseMin, sunsetMin, lastSunYmd;
 extern time_t lastSyncTime;
+extern FetchBackoff sunBackoff;
 
 extern bool sleepDimmed, sleepOff, manualDimMode;
 extern unsigned long lastInteractionMs;
 extern int sleepIntervalMin, sleepOffDelaySec;
 
+// Runtime touch calibration (spec: "long-press the STATUS header for 5s to
+// run touch calibration; values are stored in NVS" -- Phase 7 builds the
+// actual calibration routine; this storage exists from Phase 2 onward so
+// readTouchXY() always reads through it instead of config.h's fixed
+// defaults). Defaults to config.h's TOUCH_X_MIN/MAX/Y_MIN/MAX until a
+// calibration has actually been run and saved.
+extern int touchCalXMin, touchCalXMax, touchCalYMin, touchCalYMax;
+void saveTouchCalibration(int xMin, int xMax, int yMin, int yMax);
+
+// Spec "Hardening" > "Edge cases": "NTP not yet synced (show '--:--')" --
+// any epoch before this is clearly pre-sync, not a real clock reading.
+// Same threshold main.cpp's waitForNtpTime() uses at boot.
+bool timeIsSynced();
+
 int ymdFromLocal(time_t t);
 int minutesFromLocalEpoch(time_t t);
 int minutesNowLocal();
-String sanitizePsiRegion(const String& region);
-int sanitizeTimerMinutes(int value);
 
-void resetFocusTimer();
-void startFocusTimer(unsigned long minutes);
-void dismissTimerDoneDialog();
-void openTimerDoneDialog();
-void updateFocusTimerState();
-void updateTimerDoneDialogState();
+// Spec "Home" > "Interactions"/"Timer states".
+void startOrToggleFocusTimer();  // tap: idle->running, running->paused, paused->running
+void cycleFocusDuration();       // long-press while idle: 5->10->15->25->45->5...
+void resetFocusTimerToIdle();    // long-press while paused
+void dismissTimerDone();         // tap anywhere while done, or 60s auto-dismiss
+void updateFocusTimerState();    // ticks the running countdown; running->done at zero
+void updateTimerDoneAutoDismiss();
 
 void applyShellColourByKey(const String& key);
 const char* shellColourLabel(const String& key);
 bool isValidShellColourKey(const String& key);
 int shellColourCount();
 void shellColourAt(int idx, const char** key, const char** label, uint16_t* swatch);
+void colourwayRolesAt(int idx, uint16_t* bg, uint16_t* ink, uint16_t* muted, uint16_t* rule, uint16_t* accent);
 void applyOrientationByKey(const String& key);
 
 void loadStoredSettings();

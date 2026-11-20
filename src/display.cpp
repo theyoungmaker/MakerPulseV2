@@ -2,24 +2,18 @@
 #include "network.h"
 #include <math.h>
 
-// "Colourway theme" Home page redesign -- see MakerPulseV2/CONTEXT.md.
-// Only Home uses these; Weather/Bus/Status are unchanged until they're
-// redesigned too (see the "Colourway theme" glossary entry for why).
-#include "fonts/InterBlackBig.h"
-#include "fonts/InterBlackMed.h"
+// V2.1.0 spec font set (docs/MAKERPULSE_V2_SPEC.md "Type scale") -- see
+// MakerPulseV2/CONTEXT.md's "Colourway" entry. Being wired in page by page
+// across Phases 1-7; until a page's phase lands it still draws with
+// whatever it had before.
+#include "fonts/FDisplay.h"
+#include "fonts/FNum.h"
+#include "fonts/FTitle.h"
+#include "fonts/FHead.h"
+#include "fonts/FBodyReg.h"
+#include "fonts/FBodyBold.h"
+#include "fonts/FSmall.h"
 
-
-
-static String wifiStatusText() {
-  if (!wifiEnabled) return "Disabled";
-  return WiFi.status() == WL_CONNECTED ? "Online" : "Offline";
-}
-
-
-static String signalText() {
-  if (!wifiEnabled || WiFi.status() != WL_CONNECTED) return "-- dBm";
-  return String(WiFi.RSSI()) + " dBm";
-}
 
 
 static String ipText() {
@@ -46,23 +40,6 @@ static String formatClockParts(const struct tm& tmValue, bool withSeconds) {
 static String formatDateParts(const struct tm& tmValue) {
   char buf[32];
   strftime(buf, sizeof(buf), useUsRegionFormat() ? "%a %m/%d/%Y" : "%a %d.%m.%Y", &tmValue);
-  return String(buf);
-}
-
-
-static String formatMinuteOfDay(int minOfDay) {
-  if (minOfDay < 0) return "--:--";
-  if (useUsRegionFormat()) {
-    int hour24 = minOfDay / 60;
-    int minute = minOfDay % 60;
-    int hour12 = hour24 % 12;
-    if (hour12 == 0) hour12 = 12;
-    char buf[12];
-    snprintf(buf, sizeof(buf), "%d:%02d %s", hour12, minute, hour24 >= 12 ? "PM" : "AM");
-    return String(buf);
-  }
-  char buf[6];
-  snprintf(buf, sizeof(buf), "%02d:%02d", minOfDay / 60, minOfDay % 60);
   return String(buf);
 }
 
@@ -96,10 +73,8 @@ static String tempRangeText() {
 }
 
 
-// Home V2 presentational helpers -- degree-sign display instead of a C/F
-// letter suffix (the "Colourway theme" mockup omits the unit letter
-// entirely), and a qualitative rain label following the same raw-value ->
-// threshold-label pattern already used by kpLevelText()/uvLevelText().
+// Home presentational helper -- degree-sign display instead of a C/F
+// letter suffix (the spec's Home tiles show "29°", not "29C").
 static String formatDegreeOnly(float value) {
   String t = formatDisplayTemp(value); // reuses the same rounding/unit conversion
   if (t == "--") return t;
@@ -112,11 +87,51 @@ static String tempRangeDegreeText() {
 }
 
 
-static String rainLevelText() {
-  if (isnan(precipMm)) return "--";
-  if (precipMm < 1.0f) return "light";
-  if (precipMm < 4.0f) return "moderate";
-  return "heavy";
+// Spec "Home" > "Layout"/"Data rules": Rain tile shows the highest
+// precipitation_probability over the next 3 hours (hourly indices 1..3 --
+// index 0 is the current hour) and an intensity word from the strongest
+// WMO weather code in that same window.
+static int rainChancePercent() {
+  if (hourlyFilled <= 1) return -1;
+  int end = (hourlyFilled < HOURLY_COUNT) ? hourlyFilled : HOURLY_COUNT;
+  int maxP = -1;
+  for (int i = 1; i < end; i++) {
+    if (hourlyPrecipProb[i] > maxP) maxP = hourlyPrecipProb[i];
+  }
+  return maxP;
+}
+
+
+static String rainChanceText() {
+  int p = rainChancePercent();
+  return p < 0 ? "--%" : String(p) + "%";
+}
+
+
+static int rainCodeRank(int code) {
+  if (code == 95 || (code >= 96 && code <= 99)) return 4; // storm
+  if (code == 65 || code == 82) return 3;                  // heavy
+  if (code == 63 || code == 81) return 2;                  // showers
+  if ((code >= 51 && code <= 55) || code == 61 || code == 80) return 1; // light
+  return 0;
+}
+
+
+static String rainIntensityWord() {
+  if (hourlyFilled <= 1) return "dry now";
+  int end = (hourlyFilled < HOURLY_COUNT) ? hourlyFilled : HOURLY_COUNT;
+  int bestRank = 0;
+  for (int i = 1; i < end; i++) {
+    int r = rainCodeRank(hourlyCode[i]);
+    if (r > bestRank) bestRank = r;
+  }
+  switch (bestRank) {
+    case 4: return "storm";
+    case 3: return "heavy";
+    case 2: return "showers";
+    case 1: return "light";
+    default: return "dry now";
+  }
 }
 
 
@@ -141,31 +156,47 @@ static void splitNumericPrefix(const String& s, String& numPart, String& restPar
 }
 
 
-static void drawDegreeRing(int cx, int cy, uint16_t color) {
-  tft.drawCircle(cx, cy, 3, color);
+static void drawDegreeRing(int cx, int cy, int r, uint16_t color) {
+  tft.drawCircle(cx, cy, r, color);
 }
 
 
-// Draws `text` in the currently-set font, substituting a small ring for
-// the UTF-8 degree sign (0xC2 0xB0) since neither custom font contains it.
+// Draws `text` in the currently-set font, substituting small drawn glyphs
+// for two UTF-8 sequences neither custom font contains: the degree sign
+// (0xC2 0xB0, a ring) and the middle dot (0xC2 0xB7, a filled dot) -- the
+// spec's own copy uses both throughout ("29°", "Sunrise 6:59 · Sunset
+// 19:05", "paused · hold to reset"). Both glyphs are sized proportionally
+// to the currently-set font's height, not a fixed pixel radius -- a radius
+// tuned for an 11px label looks like a disconnected speck next to a 56px
+// clock digit otherwise.
 static int drawTextWithDegree(int x, int y, const String& text, uint16_t fg, uint16_t bg) {
   tft.setTextColor(fg, bg);
   tft.setTextDatum(TL_DATUM);
+  int fh = tft.fontHeight();
   int n = text.length();
   int cx = x;
   int i = 0;
   String buf = "";
 
   while (i < n) {
-    if ((uint8_t)text[i] == 0xC2 && i + 1 < n && (uint8_t)text[i + 1] == 0xB0) {
+    bool isDegree = (uint8_t)text[i] == 0xC2 && i + 1 < n && (uint8_t)text[i + 1] == 0xB0;
+    bool isMiddot = (uint8_t)text[i] == 0xC2 && i + 1 < n && (uint8_t)text[i + 1] == 0xB7;
+    if (isDegree || isMiddot) {
       if (buf.length() > 0) {
         tft.drawString(buf, cx, y);
         cx += tft.textWidth(buf);
         buf = "";
       }
-      int r = 3;
-      drawDegreeRing(cx + r + 1, y + r + 1, fg);
-      cx += 2 * r + 5;
+      if (isDegree) {
+        // A real ° sits near cap-height, at the upper third of the glyph box.
+        int r = max(2, fh / 7);
+        drawDegreeRing(cx + r + 1, y + r + 1, r, fg);
+        cx += 2 * r + 4;
+      } else {
+        int r = max(1, fh / 10);
+        tft.fillCircle(cx + r + 2, y + fh / 2, r, fg);
+        cx += 2 * r + 6;
+      }
       i += 2;
       continue;
     }
@@ -177,6 +208,56 @@ static int drawTextWithDegree(int x, int y, const String& text, uint16_t fg, uin
     cx += tft.textWidth(buf);
   }
   return cx;
+}
+
+
+// Width `text` would occupy if drawn via drawTextWithDegree() in the
+// currently-set font -- same substitution widths (ring: 2*3+5, dot:
+// 2*2+8), so a caller can centre text containing either glyph.
+static int measureTextWithGlyphs(const String& text) {
+  int fh = tft.fontHeight();
+  int degreeW = 2 * max(2, fh / 7) + 4;
+  int middotW = 2 * max(1, fh / 10) + 6;
+
+  int n = text.length();
+  int w = 0;
+  int i = 0;
+  String buf = "";
+  while (i < n) {
+    bool isDegree = (uint8_t)text[i] == 0xC2 && i + 1 < n && (uint8_t)text[i + 1] == 0xB0;
+    bool isMiddot = (uint8_t)text[i] == 0xC2 && i + 1 < n && (uint8_t)text[i + 1] == 0xB7;
+    if (isDegree || isMiddot) {
+      if (buf.length() > 0) { w += tft.textWidth(buf); buf = ""; }
+      w += isDegree ? degreeW : middotW;
+      i += 2;
+      continue;
+    }
+    buf += text[i];
+    i++;
+  }
+  if (buf.length() > 0) w += tft.textWidth(buf);
+  return w;
+}
+
+
+static void drawTextWithGlyphsCentered(int cx, int y, const String& text, uint16_t fg, uint16_t bg) {
+  int w = measureTextWithGlyphs(text);
+  drawTextWithDegree(cx - w / 2, y, text, fg, bg);
+}
+
+
+// Spec "Hourly column": "rain-bar track 12x20... rule... with an accent
+// bar filled from the bottom, height = round(chance*20), minimum 2px."
+static void drawRainBar(int cx, int y, int chancePercent, uint16_t trackColor, uint16_t fillColor, uint16_t bg) {
+  int trackX = cx - 6, trackW = 12, trackH = 20;
+  tft.fillRoundRect(trackX, y, trackW, trackH, 2, bg);
+  tft.drawRoundRect(trackX, y, trackW, trackH, 2, trackColor);
+  int fillH = (int)roundf(chancePercent * trackH / 100.0f);
+  if (chancePercent > 0 && fillH < 2) fillH = 2;
+  if (fillH > trackH - 2) fillH = trackH - 2; // keep the track's rounded top border visible
+  if (fillH > 0) {
+    tft.fillRoundRect(trackX, y + trackH - fillH, trackW, fillH, 2, fillColor);
+  }
 }
 
 
@@ -200,6 +281,60 @@ static void drawValueWithSuffix(int x, int y, const String& value, const GFXfont
     int baselineShim = 10; // font1 sits visually high next to the big font's baseline
     drawTextWithDegree(cx + 2, y + baselineShim, restPart, fg, bg);
   }
+}
+
+
+// Spec "Type scale": "Small-caps labels are simply uppercase strings in
+// F_SMALL; letter-spacing is applied by drawing with +1 px per character."
+// Supports the three horizontal datums the spec's Home layout actually
+// uses (left, centre, right); y is always the TL-style top of the glyphs.
+// Returns the tracked width, in case a caller needs it (e.g. an underline).
+// TFT_eSPI's textWidth() special-cases the *last* character of whatever
+// string you pass it -- it uses (xOffset+width) instead of xAdvance for
+// that one character, on the theory that a right-aligned string shouldn't
+// count trailing bearing. That's fine for measuring a whole string once,
+// but calling textWidth() on a series of 1-character strings (as
+// drawSmallCapsLabel() used to) makes *every* character "the last one",
+// so blank glyphs like space measure as 0 width instead of their real
+// advance -- this is exactly why "BUS STOP" rendered as "BUSSTOP". Reads
+// xAdvance straight out of the GFXglyph table instead, bypassing that
+// per-call special case entirely.
+static int gfxGlyphAdvance(const GFXfont* font, char c) {
+  uint16_t first = pgm_read_word(&font->first);
+  uint16_t last = pgm_read_word(&font->last);
+  uint8_t uc = (uint8_t)c;
+  if (uc < first || uc > last) return 0;
+  GFXglyph* glyphs = (GFXglyph*)pgm_read_dword(&font->glyph);
+  return pgm_read_byte(&glyphs[uc - first].xAdvance);
+}
+
+
+static int drawSmallCapsLabel(const String& text, int x, int y, uint8_t datum, uint16_t fg, uint16_t bg) {
+  String upper = text;
+  upper.toUpperCase();
+  int n = upper.length();
+
+  int totalW = 0;
+  for (int i = 0; i < n; i++) totalW += gfxGlyphAdvance(&F_SMALL, upper[i]) + 1;
+  if (n > 0) totalW -= 1; // no trailing gap after the last glyph
+
+  int startX = x;
+  if (datum == TC_DATUM) startX = x - totalW / 2;
+  else if (datum == TR_DATUM) startX = x - totalW;
+
+  tft.setFreeFont(&F_SMALL);
+  tft.setTextColor(fg, bg);
+  tft.setTextDatum(TL_DATUM);
+
+  int cx = startX;
+  for (int i = 0; i < n; i++) {
+    char ch = upper[i];
+    tft.drawString(String(ch), cx, y);
+    cx += gfxGlyphAdvance(&F_SMALL, ch) + 1;
+  }
+
+  tft.setFreeFont(NULL);
+  return totalW;
 }
 
 
@@ -236,118 +371,123 @@ static String windDirectionText() {
 }
 
 
-static String kpText() {
-  return isnan(kpIndex) ? "Kp --" : "Kp " + String(kpIndex, 1);
-}
-
-
-static String kpLevelText() {
-  if (isnan(kpIndex)) return "--";
-  if (kpIndex < 3.0f) return "Low";
-  if (kpIndex < 5.0f) return "Medium";
-  if (kpIndex < 7.0f) return "High";
-  return "Extreme";
-}
-
-
-static String psiText() {
-  return isnan(psiValue) ? "PSI --" : "PSI " + String((int)roundf(psiValue));
-}
-
-
-static String psiLevelText() {
-  if (isnan(psiValue)) return "--";
-  if (psiValue <= 50.0f) return "Good";
-  if (psiValue <= 100.0f) return "Moderate";
-  if (psiValue <= 200.0f) return "Unhealthy";
-  if (psiValue <= 300.0f) return "V.Unhealthy";
+// Spec "Weather" > "Data mapping" PSI/UV tables, verbatim. PSI turns
+// accent once it clears "Moderate" (101+); UV never does (no accent row).
+static String psiLevelWord(float value, bool& isAccent) {
+  isAccent = false;
+  if (isnan(value)) return "--";
+  if (value <= 50.0f) return "Good";
+  if (value <= 100.0f) return "Moderate";
+  isAccent = true;
+  if (value <= 200.0f) return "Unhealthy";
+  if (value <= 300.0f) return "Very unhealthy";
   return "Hazardous";
 }
 
 
-static String busEtaText() {
-  if (busStops[0].code.length() == 0) return "No stop";
-  if (!busDataValidByStop[0]) return "--";
-  if (busServiceCountByStop[0] == 0) return "No bus";
-  int eta1 = busServicesByStop[0][0].eta1;
-  return eta1 <= 0 ? "Due" : String(eta1) + " min";
+// Spec "Bus" > "Data rules": "floor((EstimatedArrival-now)/60)" -- always
+// computed fresh from the stored epoch at draw time (never cached as a
+// stale pre-converted minute count). Returns -1 for "no bus" (epoch 0).
+static int busMinutesUntil(time_t arrivalEpoch) {
+  if (arrivalEpoch <= 0) return -1;
+  long sec = (long)(arrivalEpoch - time(nullptr));
+  if (sec < 0) sec = 0;
+  return (int)(sec / 60);
 }
 
 
-static String busDetailText() {
-  if (busStops[0].code.length() == 0) return "Set in settings";
-  if (!busDataValidByStop[0] || busServiceCountByStop[0] == 0) return "--";
-  String label = "Bus " + busServicesByStop[0][0].serviceNo;
-  int eta2 = busServicesByStop[0][0].eta2;
-  if (eta2 >= 0) {
-    label += eta2 <= 0 ? " +due" : " +" + String(eta2) + "m";
+// Favourite service (favBusService) if set and present in the active
+// stop's fetched list; otherwise the soonest service, so the tile never
+// just goes blank before the user has picked a favourite.
+static int homeBusServiceIdx() {
+  int count = busServiceCountByStop[busActiveStopIdx];
+  if (count == 0) return -1;
+  if (favBusService.length() > 0) {
+    for (int i = 0; i < count; i++) {
+      if (busServicesByStop[busActiveStopIdx][i].serviceNo == favBusService) return i;
+    }
   }
-  return label;
+  return 0; // services are stored sorted by soonest ETA (fetchBusArrival())
 }
 
 
-static String uvText() {
-  return isnan(uvIndex) ? "UV --" : "UV " + String(uvIndex, 1);
+static String homeBusLabelText() {
+  if (busStops[busActiveStopIdx].code.length() == 0) return "BUS";
+  int idx = homeBusServiceIdx();
+  if (idx < 0) return "BUS";
+  return "BUS " + busServicesByStop[busActiveStopIdx][idx].serviceNo;
 }
 
 
-static String uvLevelText() {
-  if (isnan(uvIndex)) return "--";
-  if (uvIndex < 3.0f) return "Low";
-  if (uvIndex < 6.0f) return "Moderate";
-  if (uvIndex < 8.0f) return "High";
-  if (uvIndex < 11.0f) return "Very High";
+// value/valueColor pair: "Arr" in accent at <=0 min, "~12" in muted when
+// not monitored, "-" when there's no bus at all.
+static void homeBusValueParts(String& value, uint16_t& valueColor, uint16_t accentColor, uint16_t inkColor, uint16_t mutedColor) {
+  if (busStops[busActiveStopIdx].code.length() == 0 || !busDataValidByStop[busActiveStopIdx]) {
+    value = "--"; valueColor = mutedColor; return;
+  }
+  int idx = homeBusServiceIdx();
+  if (idx < 0) { value = "-"; valueColor = mutedColor; return; }
+
+  const BusServiceInfo& svc = busServicesByStop[busActiveStopIdx][idx];
+  int eta1 = busMinutesUntil(svc.arrival1);
+  if (!svc.monitored) {
+    value = "~" + String(eta1 < 0 ? 0 : eta1);
+    valueColor = mutedColor;
+    return;
+  }
+  if (eta1 <= 0) { value = "Arr"; valueColor = accentColor; return; }
+  value = String(eta1) + " min";
+  valueColor = inkColor;
+}
+
+
+static String homeBusSubText() {
+  if (busStops[busActiveStopIdx].code.length() == 0) return "set on bus page";
+  int idx = homeBusServiceIdx();
+  if (idx < 0) return "no bus";
+  int eta2 = busMinutesUntil(busServicesByStop[busActiveStopIdx][idx].arrival2);
+  if (eta2 < 0) return "no bus";
+  return "next " + String(eta2) + " min";
+}
+
+
+static String uvLevelWord(float value) {
+  if (isnan(value)) return "--";
+  if (value < 3.0f) return "Low";
+  if (value < 6.0f) return "Moderate";
+  if (value < 8.0f) return "High";
+  if (value < 11.0f) return "Very high";
   return "Extreme";
 }
 
 
+// Spec "Weather" > "Data mapping" WMO table, verbatim.
 static String weatherConditionText(int code) {
   switch (code) {
     case 0: return "Clear";
-    case 1: return "Mainly Clear";
-    case 2: return "Cloudy";
+    case 1: return "Mostly clear";
+    case 2: return "Partly cloudy";
     case 3: return "Overcast";
     case 45:
     case 48: return "Fog";
     case 51:
     case 53:
-    case 55: return "Drizzle";
+    case 55:
     case 56:
-    case 57: return "Fz Drizzle";
-    case 61:
-    case 63:
-    case 65: return "Rain";
+    case 57: return "Drizzle";
+    case 61: return "Light rain";
+    case 63: return "Rain";
+    case 65:
     case 66:
-    case 67: return "Fz Rain";
-    case 71:
-    case 73:
-    case 75: return "Snow";
-    case 77: return "Snow Grains";
-    case 80:
-    case 81:
-    case 82: return "Showers";
-    case 85:
-    case 86: return "Snow Showers";
-    case 95: return "T-Storm";
+    case 67: return "Heavy rain";
+    case 80: return "Showers";
+    case 81: return "Heavy showers";
+    case 82: return "Violent showers";
+    case 95:
     case 96:
-    case 99: return "Storm+Hail";
-    default: return "--";
+    case 99: return "Thunderstorm";
+    default: return "Cloudy";
   }
-}
-
-
-static String apparentTempText() {
-  if (isnan(apparentTempC)) return "";
-  return "Feels " + formatDisplayTemp(apparentTempC);
-}
-
-
-static uint16_t statusColor() {
-  // Text color is fixed (ink) under the shell-colour system -- no custom
-  // text preset can clash with these semantic colors anymore, so the
-  // colored status dot is unconditional now.
-  if (!wifiEnabled) return COL_YELLOW;
-  return WiFi.status() == WL_CONNECTED ? COL_GREEN : COL_RED;
 }
 
 
@@ -365,24 +505,6 @@ static String uptimeText() {
 }
 
 
-static String nextSunLabel() {
-  int nowMin = minutesNowLocal();
-  if (sunriseMin < 0 || sunsetMin < 0) return "Sun";
-  if (nowMin < sunriseMin) return "Sunrise";
-  if (nowMin < sunsetMin) return "Sunset";
-  return "Sunrise";
-}
-
-
-static String nextSunTimeText() {
-  int nowMin = minutesNowLocal();
-  if (sunriseMin < 0 || sunsetMin < 0) return "--:--";
-  if (nowMin < sunriseMin) return formatMinuteOfDay(sunriseMin);
-  if (nowMin < sunsetMin) return formatMinuteOfDay(sunsetMin);
-  return formatMinuteOfDay(sunriseMin);
-}
-
-
 static String formatTimerClock(unsigned long totalSec) {
   unsigned long minutes = totalSec / 60UL;
   unsigned long seconds = totalSec % 60UL;
@@ -393,28 +515,17 @@ static String formatTimerClock(unsigned long totalSec) {
 }
 
 
-static String focusHintText() {
-  if (focusTimerFinished) return "Tap to reset";
-  if (focusTimerRunning) return String((focusDurationSec / 60UL)) + " min session";
-  return "Tap to start";
+// Spec "Timer states": idle "tap to start", running "tap to pause", paused
+// "paused · hold to reset". Done has its own takeover screen, not a tile.
+static String focusSubText() {
+  switch (focusTimerState) {
+    case TIMER_RUNNING: return "tap to pause";
+    case TIMER_PAUSED:  return String("paused ") + (char)0xC2 + (char)0xB7 + " hold to reset";
+    default:            return "tap to start";
+  }
 }
 
 
-static String formatElapsedText(unsigned long totalSec) {
-  unsigned long minutes = totalSec / 60UL;
-  if (minutes == 0) return "< 1 minute elapsed";
-  if (minutes == 1) return "1 minute elapsed";
-  return String(minutes) + " minutes elapsed";
-}
-
-
-static String lastSyncText() {
-  if (lastSyncTime <= 0) return "Sync --:--";
-
-  struct tm tmSync;
-  localtime_r(&lastSyncTime, &tmSync);
-  return "Sync " + formatClockParts(tmSync, false);
-}
 
 
 static String weekNumberText() {
@@ -424,16 +535,6 @@ static String weekNumberText() {
   char buf[4];
   strftime(buf, sizeof(buf), "%V", &tmNow);
   return String(buf);
-}
-
-
-static String timerDoneCountdownText() {
-  if (!timerDoneDialogOpen) return "";
-
-  unsigned long elapsedMs = millis() - timerDoneDialogStartedMs;
-  unsigned long remainingMs = (elapsedMs >= TIMER_DONE_DIALOG_MS) ? 0 : (TIMER_DONE_DIALOG_MS - elapsedMs);
-  unsigned long remainingSec = (remainingMs + 999UL) / 1000UL;
-  return String("Auto close in ") + String(remainingSec) + "s";
 }
 
 
@@ -453,7 +554,7 @@ void wakeDisplay(bool clearManualMode) {
   sleepOff = false;
   if (clearManualMode) manualDimMode = false;
   lastInteractionMs = millis();
-  setBacklight(BL_FULL);
+  setBacklight(brightnessPwm());
   pageDirty = true;
 }
 
@@ -489,7 +590,7 @@ void toggleSleepMode() {
 
 
 void handleAutoSleep() {
-  if (focusMenuOpen || timerDoneDialogOpen) return;
+  if (focusTimerState == TIMER_DONE) return;
   if (sleepIntervalMin <= 0) return;
 
   unsigned long now = millis();
@@ -515,8 +616,8 @@ bool readTouchXY(int& sx, int& sy) {
   TS_Point p = ts.getPoint();
   if (p.z < 80 || p.z > 4000) return false;
 
-  int x = map(p.x, TOUCH_X_MIN, TOUCH_X_MAX, 0, SCREEN_W);
-  int y = map(p.y, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, SCREEN_H);
+  int x = map(p.x, touchCalXMin, touchCalXMax, 0, SCREEN_W);
+  int y = map(p.y, touchCalYMin, touchCalYMax, 0, SCREEN_H);
 
   x = constrain(x, 0, SCREEN_W - 1);
   y = constrain(y, 0, SCREEN_H - 1);
@@ -555,893 +656,620 @@ bool touchNewPress(int& tx, int& ty) {
 }
 
 
+// Spec "Touch and gestures": a tap is <=400ms and moves <10px; a long-press
+// fires once, exactly at the 600ms threshold, without waiting for release
+// (so the UI can give instant feedback). Anything else -- held past 400ms
+// without reaching 600ms, or moved too far -- resolves to no event at all,
+// same as a drag/swipe being ignored.
+bool pollTouchEvent(TouchEvt& evt, bool& justPressed) {
+  static bool wasDown = false;
+  static unsigned long pressStartMs = 0;
+  static int startX = 0, startY = 0;
+  static int maxMoveSq = 0;
+  static bool longPressFired = false;
+
+  evt.type = TOUCH_NONE;
+  justPressed = false;
+
+  int x = 0, y = 0;
+  bool down = readTouchXY(x, y);
+  unsigned long now = millis();
+
+  if (down && !wasDown) {
+    pressStartMs = now;
+    startX = x;
+    startY = y;
+    maxMoveSq = 0;
+    longPressFired = false;
+    justPressed = true;
+  } else if (down && wasDown) {
+    int dx = x - startX, dy = y - startY;
+    int distSq = dx * dx + dy * dy;
+    if (distSq > maxMoveSq) maxMoveSq = distSq;
+    bool withinTapMove = maxMoveSq < (V2_TAP_MAX_MOVE_PX * V2_TAP_MAX_MOVE_PX);
+    if (!longPressFired && withinTapMove && (now - pressStartMs) >= (unsigned long)V2_LONGPRESS_MS) {
+      longPressFired = true;
+      evt.type = TOUCH_LONG_PRESS;
+      evt.x = startX;
+      evt.y = startY;
+    }
+  } else if (!down && wasDown) {
+    unsigned long heldMs = now - pressStartMs;
+    bool withinTapMove = maxMoveSq < (V2_TAP_MAX_MOVE_PX * V2_TAP_MAX_MOVE_PX);
+    if (!longPressFired && withinTapMove && heldMs <= (unsigned long)V2_TAP_MAX_MS) {
+      evt.type = TOUCH_TAP;
+      evt.x = startX;
+      evt.y = startY;
+    }
+  }
+
+  wasDown = down;
+  return evt.type != TOUCH_NONE;
+}
+
+
+unsigned long touchHoldMsInRect(int rx, int ry, int rw, int rh) {
+  static bool holding = false;
+  static int anchorX = 0, anchorY = 0;
+  static unsigned long holdStartMs = 0;
+
+  int x = 0, y = 0;
+  bool inRect = readTouchXY(x, y) && x >= rx && x < rx + rw && y >= ry && y < ry + rh;
+  if (!inRect) {
+    holding = false; // released, or moved out of the rect -- next entry starts fresh
+    return 0;
+  }
+
+  unsigned long now = millis();
+  if (!holding) {
+    holding = true;
+    anchorX = x;
+    anchorY = y;
+    holdStartMs = now;
+    return 0;
+  }
+  int dx = x - anchorX, dy = y - anchorY;
+  if (dx * dx + dy * dy >= (V2_TAP_MAX_MOVE_PX * V2_TAP_MAX_MOVE_PX)) {
+    // Moved too far to still be "the same hold" -- restart the anchor
+    // rather than cancel outright, so a slightly wobbly finger still works.
+    anchorX = x;
+    anchorY = y;
+    holdStartMs = now;
+    return 0;
+  }
+  return now - holdStartMs;
+}
+
+
+// Spec "Touch and gestures" > "Calibration": a two-point crosshair
+// routine. Reads raw ts.getPoint() values directly -- readTouchXY()
+// already applies the calibration this is in the middle of replacing.
+// Solves the linear map(raw, calMin, calMax, 0, screenSize) equation
+// from two (raw, target) samples; touchFlipX/Y are mirrors applied
+// *after* that map in readTouchXY(), so they're undone here (mirrors are
+// their own inverse) to get the pre-flip target each raw sample must
+// resolve to, independent of whatever orientation is currently set.
+static int touchCalStep = 0; // 0 = idle, 1 = waiting for point A, 2 = waiting for point B
+static int touchCalRawAx = 0, touchCalRawAy = 0;
+static bool touchCalWasDown = false;
+
+static void solveLinearCal(int rawA, int targetA, int rawB, int targetB, int screenSize, int& calMin, int& calMax) {
+  if (rawB == rawA) { calMin = rawA - screenSize / 2; calMax = rawA + screenSize / 2; return; }
+  float k = (float)(targetB - targetA) / (float)(rawB - rawA);
+  float calMinF = rawA - (targetA / k);
+  calMin = (int)roundf(calMinF);
+  calMax = (int)roundf(calMinF + (screenSize / k));
+}
+
+
+static void drawCalibrationCrosshair(int x, int y, const char* label) {
+  tft.fillScreen(COL_BG);
+  tft.drawFastHLine(x - 10, y, 20, COL_ACCENT);
+  tft.drawFastVLine(x, y - 10, 20, COL_ACCENT);
+  tft.drawCircle(x, y, 6, COL_ACCENT);
+  tft.setFreeFont(&F_BODY_REG);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.drawString(label, SCREEN_W / 2, 150);
+  tft.setFreeFont(NULL);
+  tft.setTextDatum(TL_DATUM);
+}
+
+
+bool touchCalibrationActive() { return touchCalStep != 0; }
+
+
+void startTouchCalibration() {
+  touchCalStep = 1;
+  touchCalWasDown = false;
+  drawCalibrationCrosshair(CAL_PT_A_X, CAL_PT_A_Y, "Tap the crosshair");
+}
+
+
+void updateTouchCalibration() {
+  TS_Point p;
+  bool down = ts.touched();
+  if (down) p = ts.getPoint();
+  bool validTouch = down && p.z >= 80 && p.z <= 4000;
+
+  if (validTouch && !touchCalWasDown) {
+    if (touchCalStep == 1) {
+      touchCalRawAx = p.x;
+      touchCalRawAy = p.y;
+      touchCalStep = 2;
+      drawCalibrationCrosshair(CAL_PT_B_X, CAL_PT_B_Y, "Tap the crosshair");
+    } else if (touchCalStep == 2) {
+      int targetAx = touchFlipX ? (SCREEN_W - 1 - CAL_PT_A_X) : CAL_PT_A_X;
+      int targetBx = touchFlipX ? (SCREEN_W - 1 - CAL_PT_B_X) : CAL_PT_B_X;
+      int targetAy = touchFlipY ? (SCREEN_H - 1 - CAL_PT_A_Y) : CAL_PT_A_Y;
+      int targetBy = touchFlipY ? (SCREEN_H - 1 - CAL_PT_B_Y) : CAL_PT_B_Y;
+
+      int newXMin, newXMax, newYMin, newYMax;
+      solveLinearCal(touchCalRawAx, targetAx, p.x, targetBx, SCREEN_W, newXMin, newXMax);
+      solveLinearCal(touchCalRawAy, targetAy, p.y, targetBy, SCREEN_H, newYMin, newYMax);
+
+      saveTouchCalibration(newXMin, newXMax, newYMin, newYMax);
+
+      touchCalStep = 0;
+      pageDirty = true;
+    }
+  }
+  touchCalWasDown = validTouch;
+}
+
+
 // =========================================================
 // DRAW HELPERS
 // =========================================================
-void drawCard(int x, int y, int w, int h, bool accent = false) {
-  tft.fillRoundRect(x, y, w, h, 10, COL_PANEL);
-  tft.drawRoundRect(x, y, w, h, 10, accent ? COL_ACCENT : COL_STROKE);
+// Spec "Components" > "Icon": "drawn from circles, lines and triangles on
+// a 16-unit grid, scaled to 16 or 40 px." scale=1.0 is the original
+// ~16-18px drawing; the Weather page's 40px hero icon passes scale~2.2.
+void drawCleanSunIcon(TFT_eSPI& spr, int cx, int cy, uint16_t c, float scale = 1.0f) {
+  int r = (int)(4 * scale + 0.5f);
+  int near = (int)(7 * scale + 0.5f);
+  int far = (int)(9 * scale + 0.5f);
+  int diagNear = (int)(5 * scale + 0.5f);
+  int diagFar = (int)(6 * scale + 0.5f);
+  spr.fillCircle(cx, cy, r, c);
+  spr.drawLine(cx, cy - far, cx, cy - near, c);
+  spr.drawLine(cx, cy + near, cx, cy + far, c);
+  spr.drawLine(cx - far, cy, cx - near, cy, c);
+  spr.drawLine(cx + near, cy, cx + far, cy, c);
+  spr.drawLine(cx - diagFar, cy - diagFar, cx - diagNear, cy - diagNear, c);
+  spr.drawLine(cx + diagNear, cy - diagNear, cx + diagFar, cy - diagFar, c);
+  spr.drawLine(cx - diagFar, cy + diagFar, cx - diagNear, cy + diagNear, c);
+  spr.drawLine(cx + diagNear, cy + diagNear, cx + diagFar, cy + diagFar, c);
 }
 
 
-void drawTopBar(const String& title) {
-  tft.fillRect(0, 0, SCREEN_W, TOPBAR_H, COL_PANEL_ALT);
-  tft.drawFastHLine(0, TOPBAR_H - 1, SCREEN_W, COL_STROKE);
-
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(COL_TEXT, COL_PANEL_ALT);
-  tft.drawString(title, 10, 9, 2);
-
-  const int bs = 25;
-  const int bx = SCREEN_W - bs - 6;
-  const int by = 4;
-
-  uint16_t bg = (sleepDimmed || sleepOff) ? COL_ACCENT : COL_PANEL;
-  uint16_t fg = (sleepDimmed || sleepOff) ? TFT_BLACK : COL_TEXT;
-
-  tft.fillRoundRect(bx, by, bs, bs, 7, bg);
-  tft.drawRoundRect(bx, by, bs, bs, 7, COL_ACCENT);
-
-  const int cx = bx + 12;
-  const int cy = by + 12;
-
-  tft.drawCircle(cx, cy + 1, 6, fg);
-  tft.drawFastHLine(cx - 4, cy - 5, 9, bg);
-  tft.drawFastVLine(cx, cy - 7, 6, fg);
+void drawMoonIcon(TFT_eSPI& spr, int cx, int cy, uint16_t c, uint16_t bg = COL_PANEL, float scale = 1.0f) {
+  int r = (int)(6 * scale + 0.5f);
+  int bite = (int)(4 * scale + 0.5f);
+  int biteY = (int)(2 * scale + 0.5f);
+  spr.fillCircle(cx, cy, r, c);
+  spr.fillCircle(cx + bite, cy - biteY, r, bg);
 }
 
 
-void drawNavBar() {
-  const int y = SCREEN_H - NAV_H;
-  tft.fillRect(0, y, SCREEN_W, NAV_H, COL_PANEL_ALT);
-  tft.drawFastHLine(0, y, SCREEN_W, COL_STROKE);
-
-  const int btnW = SCREEN_W / 4;
-  const char* names[4] = {"Home", "Weather", "Bus", "Status"};
-
-  for (int i = 0; i < 4; i++) {
-    int bx = i * btnW;
-    bool active = ((int)currentPage == i);
-
-    uint16_t bg = active ? COL_ACCENT : COL_PANEL;
-    uint16_t fg = active ? TFT_BLACK : COL_TEXT;
-
-    tft.fillRoundRect(bx + 4, y + 6, btnW - 8, NAV_H - 12, 8, bg);
-    tft.drawRoundRect(bx + 4, y + 6, btnW - 8, NAV_H - 12, 8, active ? COL_ACCENT : COL_STROKE);
-
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(fg, bg);
-    tft.drawString(names[i], bx + btnW / 2, y + NAV_H / 2, 1);
-  }
-
-  tft.setTextDatum(TL_DATUM);
+void drawCloudGlyph(TFT_eSPI& spr, int cx, int cy, uint16_t c, float scale = 1.0f) {
+  spr.fillCircle(cx - (int)(7 * scale), cy + (int)(2 * scale), (int)(7 * scale + 0.5f), c);
+  spr.fillCircle(cx + (int)(2 * scale), cy - (int)(4 * scale), (int)(9 * scale + 0.5f), c);
+  spr.fillCircle(cx + (int)(10 * scale), cy + (int)(2 * scale), (int)(6 * scale + 0.5f), c);
+  spr.fillRoundRect(cx - (int)(12 * scale), cy, (int)(30 * scale), (int)(10 * scale), (int)(5 * scale + 0.5f), c);
 }
 
 
-void makeSpriteCard(TFT_eSprite& spr, int w, int h, bool accent = false) {
-  spr.setColorDepth(16);
-  spr.createSprite(w, h);
-  spr.fillSprite(COL_BG);
-  spr.fillRoundRect(0, 0, w, h, 10, COL_PANEL);
-  spr.drawRoundRect(0, 0, w, h, 10, accent ? COL_ACCENT : COL_STROKE);
-}
-
-
-void pushSpriteAndDelete(TFT_eSprite& spr, int x, int y) {
-  spr.pushSprite(x, y, COL_BG);
-  spr.deleteSprite();
-}
-
-
-void drawCleanSunIcon(TFT_eSPI& spr, int cx, int cy, uint16_t c) {
-  spr.fillCircle(cx, cy, 4, c);
-  spr.drawLine(cx, cy - 9, cx, cy - 7, c);
-  spr.drawLine(cx, cy + 7, cx, cy + 9, c);
-  spr.drawLine(cx - 9, cy, cx - 7, cy, c);
-  spr.drawLine(cx + 7, cy, cx + 9, cy, c);
-  spr.drawLine(cx - 6, cy - 6, cx - 5, cy - 5, c);
-  spr.drawLine(cx + 5, cy - 5, cx + 6, cy - 6, c);
-  spr.drawLine(cx - 6, cy + 6, cx - 5, cy + 5, c);
-  spr.drawLine(cx + 5, cy + 5, cx + 6, cy + 6, c);
-}
-
-
-void drawMoonIcon(TFT_eSPI& spr, int cx, int cy, uint16_t c, uint16_t bg = COL_PANEL) {
-  spr.fillCircle(cx, cy, 6, c);
-  spr.fillCircle(cx + 4, cy - 2, 6, bg);
-}
-
-
-void drawCloudGlyph(TFT_eSPI& spr, int cx, int cy, uint16_t c) {
-  spr.fillCircle(cx - 7, cy + 2, 7, c);
-  spr.fillCircle(cx + 2, cy - 4, 9, c);
-  spr.fillCircle(cx + 10, cy + 2, 6, c);
-  spr.fillRoundRect(cx - 12, cy, 30, 10, 5, c);
-}
-
-
-void drawConditionIcon(TFT_eSPI& spr, int cx, int cy, int code, bool isDay, uint16_t accent, uint16_t dim, uint16_t bg = COL_PANEL) {
+// Spec icon kinds: clear (sun/moon), partly, cloud, rain, storm -- the WMO
+// mapping table's own "anything else -> cloud" fallback already collapses
+// fog/snow into this same set, so there's no separate fog/snow glyph.
+void drawConditionIcon(TFT_eSPI& spr, int cx, int cy, int code, bool isDay, uint16_t accent, uint16_t dim, uint16_t bg = COL_PANEL, float scale = 1.0f) {
   bool clearOrMainlyClear = (code == 0 || code == 1);
-  bool fog = (code == 45 || code == 48);
   bool thunder = (code == 95 || code == 96 || code == 99);
   bool rain = (code >= 61 && code <= 67) || (code >= 51 && code <= 57) || (code >= 80 && code <= 82);
-  bool snow = (code >= 71 && code <= 77) || code == 85 || code == 86;
 
   if (clearOrMainlyClear) {
-    if (isDay) drawCleanSunIcon(spr, cx, cy, accent);
-    else drawMoonIcon(spr, cx, cy, accent, bg);
-    if (code == 1) spr.fillCircle(cx + 9, cy + 9, 5, dim);
+    if (isDay) drawCleanSunIcon(spr, cx, cy, accent, scale);
+    else drawMoonIcon(spr, cx, cy, accent, bg, scale);
+    if (code == 1) spr.fillCircle(cx + (int)(9 * scale), cy + (int)(9 * scale), (int)(5 * scale + 0.5f), dim);
     return;
   }
 
   if (thunder) {
-    drawCloudGlyph(spr, cx, cy - 4, dim);
-    spr.drawLine(cx - 2, cy + 8, cx + 3, cy + 8, accent);
-    spr.drawLine(cx + 3, cy + 8, cx - 1, cy + 14, accent);
-    spr.drawLine(cx - 1, cy + 14, cx + 4, cy + 14, accent);
+    drawCloudGlyph(spr, cx, cy - (int)(4 * scale), dim, scale);
+    int x0 = cx - (int)(2 * scale), x1 = cx + (int)(3 * scale), x2 = cx - (int)(1 * scale), x3 = cx + (int)(4 * scale);
+    int y0 = cy + (int)(8 * scale), y1 = cy + (int)(14 * scale);
+    spr.drawLine(x0, y0, x1, y0, accent);
+    spr.drawLine(x1, y0, x2, y1, accent);
+    spr.drawLine(x2, y1, x3, y1, accent);
     return;
   }
 
   if (rain) {
-    drawCloudGlyph(spr, cx, cy - 4, dim);
+    drawCloudGlyph(spr, cx, cy - (int)(4 * scale), dim, scale);
     for (int i = -1; i <= 1; i++) {
-      spr.drawLine(cx + i * 7, cy + 9, cx + i * 7 - 2, cy + 15, accent);
+      int lx = cx + (int)(i * 7 * scale);
+      spr.drawLine(lx, cy + (int)(9 * scale), lx - (int)(2 * scale), cy + (int)(15 * scale), accent);
     }
     return;
   }
 
-  if (snow) {
-    drawCloudGlyph(spr, cx, cy - 4, dim);
-    for (int i = -1; i <= 1; i++) {
-      spr.fillCircle(cx + i * 7, cy + 12, 1, accent);
-    }
-    return;
-  }
-
-  if (fog) {
-    for (int i = 0; i < 3; i++) {
-      spr.drawFastHLine(cx - 12, cy - 4 + i * 5, 24, dim);
-    }
-    return;
-  }
-
-  drawCloudGlyph(spr, cx, cy, dim);
+  drawCloudGlyph(spr, cx, cy, dim, scale);
 }
 
 
-int drawWrappedTextLimited(int x, int y, int maxW, const String& text, int font, uint16_t fg, uint16_t bg, int maxLines) {
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(fg, bg);
-
-  const int lineH = tft.fontHeight(font) + 2;
-  String line = "";
-  String word = "";
-  int linesDrawn = 0;
-
-  auto flushLine = [&]() {
-    if (linesDrawn >= maxLines) return;
-    if (line.length() > 0) tft.drawString(line, x, y, font);
-    y += lineH;
-    line = "";
-    linesDrawn++;
-  };
-
-  auto placeWordOnEmptyLine = [&]() {
-    if (word.length() == 0 || linesDrawn >= maxLines) return;
-
-    while (tft.textWidth(word, font) > maxW && word.length() > 1) {
-      int cut = word.length();
-      while (cut > 1 && tft.textWidth(word.substring(0, cut), font) > maxW) cut--;
-      if (linesDrawn >= maxLines) return;
-      tft.drawString(word.substring(0, cut), x, y, font);
-      y += lineH;
-      linesDrawn++;
-      word = word.substring(cut);
-    }
-
-    if (linesDrawn < maxLines) {
-      line = word;
-      word = "";
-    }
-  };
-
-  auto flushWord = [&]() {
-    if (word.length() == 0 || linesDrawn >= maxLines) return;
-
-    if (line.length() == 0) {
-      placeWordOnEmptyLine();
-      return;
-    }
-
-    String candidate = line + " " + word;
-    if (tft.textWidth(candidate, font) <= maxW) {
-      line = candidate;
-      word = "";
-      return;
-    }
-
-    flushLine();
-    placeWordOnEmptyLine();
-  };
-
-  for (int i = 0; i < (int)text.length(); i++) {
-    if (linesDrawn >= maxLines) break;
-    char c = text[i];
-
-    if (c == '\n') {
-      flushWord();
-      flushLine();
-      continue;
-    }
-
-    if (c == ' ') {
-      flushWord();
-      continue;
-    }
-
-    word += c;
-  }
-
-  if (linesDrawn < maxLines) {
-    flushWord();
-    if (line.length() > 0) flushLine();
-  }
-
-  return y;
-}
-
-
-// =========================================================
-// HOME SPRITES
-// =========================================================
-void drawClockCardSprite(bool force = false) {
-  const int x = 8, y = PAGE_ROW1_Y, w = 224, h = HOME_WIDGET_H;
-
-  time_t now = time(nullptr);
-  struct tm tmNow;
-  localtime_r(&now, &tmNow);
-
-  String timeBuf = formatClockParts(tmNow, true);
-  String dateBuf = formatDateParts(tmNow);
-
-  String sr = formatMinuteOfDay(sunriseMin);
-  String ss = formatMinuteOfDay(sunsetMin);
-
-  String combined = timeBuf + "|" + dateBuf + "|" + sr + "|" + ss + "|" +
-                    String(COL_ACCENT) + "|" + String(COL_TEXT);
-
-  if (!force && combined == cacheClock) return;
-  cacheClock = combined;
-
-  makeSpriteCard(sprClock, w, h, true);
-
-  sprClock.setTextDatum(TL_DATUM);
-
-  sprClock.setTextColor(COL_TEXT, COL_PANEL);
-  if (useUsRegionFormat()) {
-    int splitAt = timeBuf.lastIndexOf(' ');
-    String clockMain = splitAt > 0 ? timeBuf.substring(0, splitAt) : timeBuf;
-    String clockSuffix = splitAt > 0 ? timeBuf.substring(splitAt + 1) : "";
-    sprClock.drawString(clockMain, 10, 11, 4);
-    if (clockSuffix.length() > 0) {
-      int suffixX = 10 + sprClock.textWidth(clockMain, 4) + 4;
-      sprClock.drawString(clockSuffix, suffixX, 18, 2);
-    }
-  } else {
-    sprClock.drawString(timeBuf, 10, 11, 4);
-  }
-
-  sprClock.setTextColor(COL_DIM, COL_PANEL);
-  sprClock.drawString(dateBuf, 10, 45, 2);
-
-  drawCleanSunIcon(sprClock, 151, 22, COL_ACCENT);
-  drawMoonIcon(sprClock, 151, 50, COL_ACCENT);
-
-  sprClock.setTextColor(COL_ACCENT, COL_PANEL);
-  sprClock.drawString(sr, 165, 15, 2);
-  sprClock.drawString(ss, 165, 43, 2);
-
-  pushSpriteAndDelete(sprClock, x, y);
-}
-
-
-void drawMetricSprite(int x, int y, int w, int h, const char* label, const String& value, String& cache, bool force = false, const String& detail = "") {
-  String combined = String(label) + "|" + value + "|" + detail + "|" + String(COL_PANEL) + "|" +
-                    String(COL_STROKE) + "|" + String(COL_TEXT);
-
-  if (!force && combined == cache) return;
-  cache = combined;
-
-  makeSpriteCard(sprSmall, w, h, true);
-
-  sprSmall.setTextDatum(TL_DATUM);
-  sprSmall.setTextColor(COL_DIM, COL_PANEL);
-  sprSmall.drawString(label, 10, 8, 2);
-
-  sprSmall.setTextColor(COL_TEXT, COL_PANEL);
-  sprSmall.drawString(value, 10, 31, 4);
-
-  if (detail.length() > 0) {
-    sprSmall.setTextColor(COL_ACCENT, COL_PANEL);
-    sprSmall.drawString(detail, 10, 55, 1);
-  }
-
-  pushSpriteAndDelete(sprSmall, x, y);
-}
-
-
-void drawWeatherStyleMetricSprite(int x, int y, int w, int h, const char* label, const String& value, String& cache, bool force = false, const String& detail = "") {
-  String combined = String(label) + "|" + value + "|" + detail + "|" + String(COL_PANEL) + "|" +
-                    String(COL_STROKE) + "|" + String(COL_TEXT);
-
-  if (!force && combined == cache) return;
-  cache = combined;
-
-  makeSpriteCard(sprSmall, w, h, true);
-
-  sprSmall.setTextDatum(TL_DATUM);
-  sprSmall.setTextColor(COL_DIM, COL_PANEL);
-  sprSmall.drawString(label, 10, 8, 2);
-
-  sprSmall.setTextColor(COL_TEXT, COL_PANEL);
-  sprSmall.drawString(value, 10, 28, 4);
-
-  if (detail.length() > 0) {
-    sprSmall.setTextColor(COL_ACCENT, COL_PANEL);
-    sprSmall.drawString(detail, 10, 52, 1);
-  }
-
-  pushSpriteAndDelete(sprSmall, x, y);
-}
-
-
-void drawSunEventWidget(int x, int y, int w, int h, String& cache, bool force = false) {
-  String label = nextSunLabel();
-  String value = nextSunTimeText();
-  String combined = label + "|" + value + "|" + String(COL_PANEL) + "|" +
-                    String(COL_STROKE) + "|" + String(COL_TEXT) + "|" + String(COL_ACCENT);
-
-  if (!force && combined == cache) return;
-  cache = combined;
-
-  makeSpriteCard(sprSmall, w, h, true);
-
-  sprSmall.setTextDatum(TL_DATUM);
-  sprSmall.setTextColor(COL_DIM, COL_PANEL);
-  sprSmall.drawString(label, 10, 8, 2);
-
-  sprSmall.setTextColor(COL_TEXT, COL_PANEL);
-  if (useUsRegionFormat()) {
-    int splitAt = value.lastIndexOf(' ');
-    String mainValue = splitAt > 0 ? value.substring(0, splitAt) : value;
-    String suffix = splitAt > 0 ? value.substring(splitAt + 1) : "";
-    sprSmall.drawString(mainValue, 10, 30, 4);
-    if (suffix.length() > 0) {
-      int suffixX = 10 + sprSmall.textWidth(mainValue, 4) + 3;
-      sprSmall.drawString(suffix, suffixX, 35, 2);
-    }
-  } else {
-    sprSmall.drawString(value, 10, 30, 4);
-  }
-
-  pushSpriteAndDelete(sprSmall, x, y);
-}
-
-
-void drawPlaceholderSprite(int x, int y, int w, int h, const char* label, String& cache, bool force = false) {
-  String combined = String(label) + "|" + String(COL_PANEL) + "|" + String(COL_STROKE) + "|" + String(COL_TEXT);
-
-  if (!force && combined == cache) return;
-  cache = combined;
-
-  makeSpriteCard(sprSmall, w, h, true);
-
-  sprSmall.setTextDatum(TL_DATUM);
-  sprSmall.setTextColor(COL_DIM, COL_PANEL);
-  sprSmall.drawString(label, 10, 8, 2);
-
-  sprSmall.setTextColor(COL_STROKE, COL_PANEL);
-  sprSmall.drawString("Empty", 10, 31, 2);
-
-  pushSpriteAndDelete(sprSmall, x, y);
-}
-
-
-void drawFocusTimerWidget(int x, int y, int w, int h, String& cache, bool force = false) {
-  String value = formatTimerClock(focusRemainingSec);
-  String hint = focusHintText();
-  String combined = value + "|" + hint + "|" + String(focusMenuOpen ? 1 : 0) +
-                    "|" + String(COL_PANEL) + "|" + String(COL_ACCENT) + "|" + String(COL_TEXT);
-
-  if (!force && combined == cache) return;
-  cache = combined;
-
-  makeSpriteCard(sprSmall, w, h, true);
-
-  sprSmall.setTextDatum(TL_DATUM);
-  sprSmall.setTextColor(COL_DIM, COL_PANEL);
-  sprSmall.drawString("Timer", 10, 8, 2);
-
-  if (focusMenuOpen) {
-    sprSmall.setTextColor(COL_TEXT, COL_PANEL);
-    sprSmall.drawString("Select", 10, 22, 4);
-    sprSmall.setTextColor(COL_DIM, COL_PANEL);
-    sprSmall.drawString("duration", 10, 44, 2);
-  } else {
-    sprSmall.setTextColor(focusTimerFinished ? COL_GREEN : COL_TEXT, COL_PANEL);
-    sprSmall.drawString(value, 10, 24, 4);
-    sprSmall.setTextColor(COL_DIM, COL_PANEL);
-    sprSmall.drawString(hint, 10, 49, 1);
-  }
-
-  pushSpriteAndDelete(sprSmall, x, y);
-}
-
-
-void drawHomeSlotWidget(int slot, bool force = false) {
-  int x, y, w, h;
-  getHomeSlotRect(slot, x, y, w, h);
-
-  switch (homeWidgetSlots[slot]) {
-    case HOME_WIDGET_WEEK:
-      drawMetricSprite(x, y, w, h, "Week", weekNumberText(), cacheHomeSlots[slot], force);
-      break;
-    case HOME_WIDGET_TIMER:
-      drawFocusTimerWidget(x, y, w, h, cacheHomeSlots[slot], force);
-      break;
-    case HOME_WIDGET_RAIN:
-      drawWeatherStyleMetricSprite(x, y, w, h, "Rain", rainText(), cacheHomeSlots[slot], force);
-      break;
-    case HOME_WIDGET_OUTDOOR:
-      drawWeatherStyleMetricSprite(x, y, w, h, "Outdoor", tempText(), cacheHomeSlots[slot], force, tempRangeText());
-      break;
-    case HOME_WIDGET_KP:
-      drawWeatherStyleMetricSprite(x, y, w, h, "KP index", kpText(), cacheHomeSlots[slot], force, kpLevelText());
-      break;
-    case HOME_WIDGET_UV:
-      drawWeatherStyleMetricSprite(x, y, w, h, "UV index", uvText(), cacheHomeSlots[slot], force, uvLevelText());
-      break;
-    case HOME_WIDGET_WIND:
-      drawWeatherStyleMetricSprite(x, y, w, h, "Wind", windText(), cacheHomeSlots[slot], force, windDirectionText());
-      break;
-    case HOME_WIDGET_SUN:
-      drawSunEventWidget(x, y, w, h, cacheHomeSlots[slot], force);
-      break;
-    case HOME_WIDGET_PSI:
-      drawWeatherStyleMetricSprite(x, y, w, h, "PSI", psiText(), cacheHomeSlots[slot], force, psiLevelText());
-      break;
-    case HOME_WIDGET_BUS:
-      drawWeatherStyleMetricSprite(x, y, w, h, "Bus", busEtaText(), cacheHomeSlots[slot], force, busDetailText());
-      break;
-  }
-}
-
-
-// "Colourway theme" overlays: flat fill (no border stroke) for the content
-// region instead of a bordered floating card, text-style controls instead
-// of bordered buttons. Hit-test regions in handle*Touch() are untouched --
-// only how each control is drawn changes, not where it is.
-void drawFocusMenuOverlay(bool force) {
-  String combined = String(focusTimerRunning ? 1 : 0) + "|" + String(focusTimerFinished ? 1 : 0) +
-                    "|" + String(COL_PANEL) + "|" + String(COL_TEXT) + "|" + String(COL_BG);
-  if (!force && combined == cacheTimerMenu) return;
-  cacheTimerMenu = combined;
-
-  tft.fillRect(0, 0, SCREEN_W, SCREEN_H, COL_BG);
-  tft.fillRoundRect(TIMER_MENU_X, TIMER_MENU_Y, TIMER_MENU_W, TIMER_MENU_H, 12, COL_PANEL);
-
-  tft.setTextColor(COL_TEXT, COL_PANEL);
-  tft.drawString("Start timer", TIMER_MENU_X + 14, TIMER_MENU_Y + 12, 2);
-  tft.setTextColor(COL_DIM, COL_PANEL);
-  tft.drawString("Choose a session length", TIMER_MENU_X + 14, TIMER_MENU_Y + 34, 1);
-
-  const int btnW = 74;
-  const int btnH = 28;
-  const int col1X = TIMER_MENU_X + 14;
-  const int col2X = TIMER_MENU_X + 112;
-  const int row1Y = TIMER_MENU_Y + 54;
-  const int row2Y = TIMER_MENU_Y + 88;
-  const int row3Y = TIMER_MENU_Y + 122;
-
-  String labels[6];
-  const int xs[] = {col1X, col2X, col1X, col2X, col1X, col2X};
-  const int ys[] = {row1Y, row1Y, row2Y, row2Y, row3Y, row3Y};
-  for (int i = 0; i < 6; i++) {
-    labels[i] = String(timerPresetMin[i]) + " min";
-  }
-
-  tft.setTextDatum(MC_DATUM);
-  for (int i = 0; i < 6; i++) {
-    tft.setTextFont(2);
-    tft.setTextColor(COL_TEXT, COL_PANEL);
-    tft.drawString(labels[i], xs[i] + btnW / 2, ys[i] + btnH / 2);
-  }
-  tft.setTextDatum(TL_DATUM);
-
-  const int actionY = TIMER_MENU_Y + 160;
-  const int actionW = 152;
-  const int actionX = TIMER_MENU_X + 24;
-  const char* actionLabel = focusTimerRunning ? "Stop" : (focusTimerFinished ? "Reset" : "Custom time");
-
-  if (focusTimerRunning) {
-    tft.fillRoundRect(actionX, actionY - 4, actionW, 26, 8, COL_RED);
-    tft.setTextColor(COL_BG, COL_RED);
-  } else {
-    tft.fillRoundRect(actionX, actionY - 4, actionW, 26, 8, COL_TEXT);
-    tft.setTextColor(COL_BG, COL_TEXT);
-  }
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextFont(2);
-  tft.drawString(actionLabel, actionX + actionW / 2, actionY + 9);
-  tft.setTextDatum(TL_DATUM);
-}
-
-
-void drawCustomTimerEntryOverlay(bool force) {
-  String combined = String(customTimerMinutes) + "|" + String(COL_PANEL) + "|" + String(COL_TEXT) + "|" + String(COL_BG);
-  if (!force && combined == cacheCustomTimer) return;
-  cacheCustomTimer = combined;
-
-  tft.fillRect(0, 0, SCREEN_W, SCREEN_H, COL_BG);
-  tft.fillRoundRect(TIMER_MENU_X, TIMER_MENU_Y, TIMER_MENU_W, TIMER_MENU_H, 12, COL_PANEL);
-
-  tft.setTextColor(COL_TEXT, COL_PANEL);
-  tft.drawString("Custom timer", TIMER_MENU_X + 14, TIMER_MENU_Y + 12, 2);
-  tft.setTextColor(COL_DIM, COL_PANEL);
-  tft.drawString("Set your own session length", TIMER_MENU_X + 14, TIMER_MENU_Y + 34, 1);
-
-  // "min" has letters the digits-only custom font can't render -- measure
-  // each part in its real font first so the number+suffix pair can still
-  // be centered as a whole (drawValueWithSuffix itself only left-aligns).
-  String valueLabel = String(customTimerMinutes) + " min";
-  String numPart, restPart;
-  splitNumericPrefix(valueLabel, numPart, restPart);
-  tft.setFreeFont(&InterBlackMed);
-  int numW = tft.textWidth(numPart);
-  tft.setFreeFont(NULL);
-  tft.setTextFont(1);
-  int restW = tft.textWidth(restPart) + 2;
-  int numStartX = TIMER_MENU_X + TIMER_MENU_W / 2 - (numW + restW) / 2;
-  drawValueWithSuffix(numStartX, TIMER_MENU_Y + 56, valueLabel, &InterBlackMed, COL_TEXT, COL_PANEL);
-
-  const int stepBtnW = 40;
-  const int stepBtnH = 30;
-  const int stepY = TIMER_MENU_Y + 96;
-  const int stepGap = 4;
-  const int stepXs[4] = {
-    TIMER_MENU_X + 14,
-    TIMER_MENU_X + 14 + (stepBtnW + stepGap),
-    TIMER_MENU_X + 14 + 2 * (stepBtnW + stepGap),
-    TIMER_MENU_X + 14 + 3 * (stepBtnW + stepGap)
-  };
-  const char* stepLabels[4] = {"-5", "-1", "+1", "+5"};
-
-  tft.setTextDatum(MC_DATUM);
-  for (int i = 0; i < 4; i++) {
-    tft.setTextFont(2);
-    tft.setTextColor(COL_TEXT, COL_PANEL);
-    tft.drawString(stepLabels[i], stepXs[i] + stepBtnW / 2, stepY + stepBtnH / 2);
-  }
-  tft.setTextDatum(TL_DATUM);
-
-  const int actionY = TIMER_MENU_Y + 160;
-  const int actionH = 26;
-  const int cancelX = TIMER_MENU_X + 14;
-  const int startX = TIMER_MENU_X + 106;
-  const int actionBtnW = 80;
-
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextFont(2);
-  tft.setTextColor(COL_DIM, COL_PANEL);
-  tft.drawString("Cancel", cancelX + actionBtnW / 2, actionY + 9);
-
-  tft.fillRoundRect(startX, actionY - 4, actionBtnW, actionH, 8, COL_TEXT);
-  tft.setTextColor(COL_BG, COL_TEXT);
-  tft.drawString("Start", startX + actionBtnW / 2, actionY + 9);
-  tft.setTextDatum(TL_DATUM);
-}
-
-
-void busEntryKeyRect(int r, int c, int& x, int& y, int& w, int& h) {
-  x = BUS_ENTRY_X + 7 + c * (BUS_ENTRY_CELL_W + BUS_ENTRY_GAP);
-  y = BUS_ENTRY_Y + 86 + r * (BUS_ENTRY_CELL_H + BUS_ENTRY_GAP);
-  w = BUS_ENTRY_CELL_W;
-  h = BUS_ENTRY_CELL_H;
-}
-
-
-void drawBusStopEntryOverlay(bool force) {
-  String combined = busStopEntryDigits + "|" + String(busStopEntryTargetIdx) + "|" +
-                     String(COL_PANEL) + "|" + String(COL_TEXT) + "|" + String(COL_BG);
-  if (!force && combined == cacheBusStopEntry) return;
-  cacheBusStopEntry = combined;
-
-  tft.fillRect(0, 0, SCREEN_W, SCREEN_H, COL_BG);
-  tft.fillRoundRect(BUS_ENTRY_X, BUS_ENTRY_Y, BUS_ENTRY_W, BUS_ENTRY_H, 12, COL_PANEL);
-
-  tft.setTextColor(COL_TEXT, COL_PANEL);
-  tft.drawString("Bus stop code", BUS_ENTRY_X + 14, BUS_ENTRY_Y + 10, 2);
-  tft.setTextColor(COL_DIM, COL_PANEL);
-  tft.drawString("Enter the code, then OK", BUS_ENTRY_X + 14, BUS_ENTRY_Y + 30, 1);
-
-  String displayDigits = busStopEntryDigits.length() > 0 ? busStopEntryDigits : "-----";
-  tft.setFreeFont(&InterBlackMed);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(busStopEntryDigits.length() > 0 ? COL_TEXT : COL_DIM, COL_PANEL);
-  tft.drawString(displayDigits, BUS_ENTRY_X + BUS_ENTRY_W / 2, BUS_ENTRY_Y + 63);
-  tft.setFreeFont(NULL);
-  tft.setTextDatum(TL_DATUM);
-
-  for (int r = 0; r < 4; r++) {
-    for (int c = 0; c < 3; c++) {
-      int bx, by, bw, bh;
-      busEntryKeyRect(r, c, bx, by, bw, bh);
-      bool isOk = (r == 3 && c == 2);
-      bool isDel = (r == 3 && c == 0);
-
-      tft.setTextDatum(MC_DATUM);
-      tft.setTextFont(2);
-      if (isOk) {
-        tft.setTextColor(COL_TEXT, COL_PANEL);
-        tft.drawString(busEntryKeys[r][c], bx + bw / 2, by + bh / 2);
-        int tw = tft.textWidth(busEntryKeys[r][c]);
-        tft.drawFastHLine(bx + bw / 2 - tw / 2, by + bh / 2 + 10, tw, COL_TEXT);
-      } else if (isDel) {
-        tft.setTextColor(COL_RED, COL_PANEL);
-        tft.drawString(busEntryKeys[r][c], bx + bw / 2, by + bh / 2);
-      } else {
-        tft.setTextColor(COL_TEXT, COL_PANEL);
-        tft.drawString(busEntryKeys[r][c], bx + bw / 2, by + bh / 2);
-      }
-      tft.setTextDatum(TL_DATUM);
-    }
-  }
-}
-
-
+// Spec "Timer states" > "Timer done takeover": accent fill, "TIME'S UP" /
+// duration / dismiss hint in bg colour, alternating accent/bg 3 times at
+// 500 ms before settling on the accent fill. Shows on top of any page
+// (drawCurrentPageFull()/updateCurrentPageDynamic() check focusTimerState
+// before touching the per-page drawer) and the timer keeps running
+// elsewhere since this is pure presentation over state.cpp's own machine.
 void drawTimerDoneOverlay(bool force) {
-  if (!timerDoneDialogOpen) return;
+  if (focusTimerState != TIMER_DONE) return;
 
-  String elapsed = formatElapsedText(focusDurationSec);
-  String countdown = timerDoneCountdownText();
-  bool flashOn = flashModeEnabled && ((millis() / 300UL) % 2UL == 0);
-  setBacklight(flashModeEnabled ? (flashOn ? FLASH_BL_HIGH : FLASH_BL_LOW) : BL_FULL);
-  String combined = elapsed + "|" + String(COL_PANEL) + "|" + String(COL_ACCENT) + "|" + String(COL_TEXT);
-  String flashKey = String(flashOn ? 1 : 0);
-  if (force || combined != cacheTimerDone || flashKey != cacheTimerDoneFlash) {
-    cacheTimerDone = combined;
-    cacheTimerDoneFlash = flashKey;
-    cacheTimerDoneCountdown = "";
+  unsigned long elapsed = millis() - focusDoneStartedMs;
+  unsigned long flashWindowMs = (unsigned long)TIMER_DONE_FLASH_COUNT * 2UL * TIMER_DONE_FLASH_MS;
+  bool flashing = elapsed < flashWindowMs;
+  bool onAccent = !flashing || ((elapsed / TIMER_DONE_FLASH_MS) % 2UL == 0);
 
-    // Flash mode still flips the backdrop to the accent color as an alert
-    // signal -- only the border/panel chrome is flattened away here.
-    uint16_t backdrop = flashOn ? COL_ACCENT : COL_BG;
-    uint16_t panelBg = flashOn ? COL_ACCENT : COL_PANEL;
-    uint16_t textOnPanel = flashOn ? COL_BG : COL_TEXT;
-    uint16_t dimOnPanel = flashOn ? COL_BG : COL_DIM;
-    tft.fillRect(0, 0, SCREEN_W, SCREEN_H, backdrop);
-    tft.fillRoundRect(TIMER_DONE_X, TIMER_DONE_Y, TIMER_DONE_W, TIMER_DONE_H, 12, panelBg);
+  uint16_t backdrop = onAccent ? COL_ACCENT : COL_BG;
+  uint16_t ink = onAccent ? COL_BG : COL_ACCENT;
 
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextFont(2);
-    tft.setTextColor(textOnPanel, panelBg);
-    tft.drawString("Timer complete", TIMER_DONE_X + TIMER_DONE_W / 2, TIMER_DONE_Y + 18);
-    tft.setTextFont(4);
-    tft.drawString(elapsed, TIMER_DONE_X + TIMER_DONE_W / 2, TIMER_DONE_Y + 48);
-    tft.setTextFont(1);
-    tft.setTextColor(dimOnPanel, panelBg);
-    tft.drawString("Tap anywhere to acknowledge", TIMER_DONE_X + TIMER_DONE_W / 2, TIMER_DONE_Y + 70);
-    tft.setTextDatum(TL_DATUM);
-  }
+  String durationText = formatTimerClock((unsigned long)FOCUS_DURATIONS_MIN[focusDurationIdx] * 60UL);
+  String combined = durationText + "|" + String(backdrop);
+  if (!force && combined == cacheTimerDone) return;
+  cacheTimerDone = combined;
 
-  if (force || countdown != cacheTimerDoneCountdown) {
-    cacheTimerDoneCountdown = countdown;
-    uint16_t panelBg = flashOn ? COL_ACCENT : COL_PANEL;
-    uint16_t dimOnPanel = flashOn ? COL_BG : COL_DIM;
-    tft.fillRect(TIMER_DONE_X + 28, TIMER_DONE_Y + 82, TIMER_DONE_W - 56, 12, panelBg);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextFont(1);
-    tft.setTextColor(dimOnPanel, panelBg);
-    tft.drawString(countdown, TIMER_DONE_X + TIMER_DONE_W / 2, TIMER_DONE_Y + 82);
-    tft.setTextDatum(TL_DATUM);
-  }
-}
+  tft.fillScreen(backdrop);
 
+  drawSmallCapsLabel("TIME'S UP", SCREEN_W / 2, 112, TC_DATUM, ink, backdrop);
 
-// =========================================================
-// HOME V2 ("Colourway theme") -- flat, borderless, case-complementary.
-// Self-contained: draws its own header/tab-bar chrome rather than calling
-// drawTopBar()/drawNavBar(), so Weather/Bus/Status (still old-style) are
-// untouched. Reuses the exact same backend data/helpers as the original
-// Home page -- only how it's drawn changes.
-// =========================================================
-static String homeV2Label(HomeWidgetType type) {
-  String s = String(homeWidgetLabel(type));
-  s.toUpperCase();
-  return s;
-}
+  tft.setFreeFont(&F_DISPLAY);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(ink, backdrop);
+  tft.drawString(durationText, SCREEN_W / 2, 130);
+  tft.setFreeFont(NULL);
 
-
-// Returns the big value string and detail (sub)string for one widget slot.
-// Mirrors the data each widget type already shows elsewhere in the app --
-// no new data sources, just different presentation.
-static void homeV2SlotText(HomeWidgetType type, String& value, String& detail) {
-  switch (type) {
-    case HOME_WIDGET_BUS:
-      value = busEtaText();
-      detail = busDetailText();
-      break;
-    case HOME_WIDGET_OUTDOOR:
-      value = formatDegreeOnly(tempC);
-      detail = tempRangeDegreeText();
-      break;
-    case HOME_WIDGET_RAIN:
-      value = rainText();
-      detail = rainLevelText();
-      break;
-    case HOME_WIDGET_TIMER:
-      if (focusMenuOpen) { value = ""; detail = "Select duration"; }
-      else { value = formatTimerClock(focusRemainingSec); detail = focusHintText(); }
-      break;
-    case HOME_WIDGET_WEEK:
-      value = weekNumberText();
-      detail = "week";
-      break;
-    case HOME_WIDGET_KP:
-      value = kpText();
-      detail = kpLevelText();
-      break;
-    case HOME_WIDGET_UV:
-      value = uvText();
-      detail = uvLevelText();
-      break;
-    case HOME_WIDGET_WIND:
-      value = windText();
-      detail = windDirectionText();
-      break;
-    case HOME_WIDGET_SUN:
-      value = nextSunTimeText();
-      detail = nextSunLabel();
-      break;
-    case HOME_WIDGET_PSI:
-      value = psiText();
-      detail = psiLevelText();
-      break;
-    default:
-      value = "--";
-      detail = "";
-      break;
-  }
-}
-
-
-static void drawHomeV2SlotWidget(int slot, bool force) {
-  int x, y, w, h;
-  getHomeSlotRect(slot, x, y, w, h);
-  HomeWidgetType type = homeWidgetSlots[slot];
-
-  String value, detail;
-  homeV2SlotText(type, value, detail);
-
-  String combined = String((int)type) + "|" + value + "|" + detail + "|" +
-                     String(COL_BG) + "|" + String(COL_TEXT) + "|" + String(COL_DIM);
-  if (!force && combined == cacheHomeSlots[slot]) return;
-  cacheHomeSlots[slot] = combined;
-
-  tft.fillRect(x, y, w, h, COL_BG);
-
+  tft.setFreeFont(&F_BODY_REG);
+  tft.drawString("Tap anywhere to dismiss", SCREEN_W / 2, 200);
+  tft.setFreeFont(NULL);
   tft.setTextDatum(TL_DATUM);
-  tft.setTextFont(1);
-  tft.setTextColor(COL_DIM, COL_BG);
-  tft.drawString(homeV2Label(type), x, y);
-
-  if (type == HOME_WIDGET_OUTDOOR) {
-    drawTextWithDegree(x, y + 14, value, COL_TEXT, COL_BG);
-  } else {
-    drawValueWithSuffix(x, y + 14, value, &InterBlackMed, COL_TEXT, COL_BG);
-  }
-
-  if (detail.length() > 0) {
-    tft.setTextFont(1);
-    drawTextWithDegree(x, y + h - 12, detail, COL_DIM, COL_BG);
-  }
 }
 
 
-// Shared by all four pages now that Weather/Bus/Status use the
-// "Colourway theme" too -- see the matching change in handleNavTouch().
+// Spec "Components"/Tab bar: labels F_BODY centred in 54px cells at y290
+// (from x V2_MARGIN_L, so 4*54=216=V2_CONTENT_W -- the label row is inset
+// to the content margins); active = Bold ink + 2px underline at y309 exactly
+// the label's width; inactive = Regular muted. The *touch* strip is wider
+// (full SCREEN_W/4 columns, y>=V2_TAB_TOUCH_Y0) per "Touch and gestures"'s
+// "tab cells are 60x44 (full width...)" -- see handleNavTouch(), unchanged.
+// "Weather" at the spec's own 13px F_BODY size still measures right at
+// ~54px -- a fixed 54px-pitch grid (one label centred per cell) has no
+// margin for that and visibly collides with its neighbours. Laid out with
+// each label's own real width plus an explicit gap instead (same
+// technique as the Status page's segmented options), then the whole group
+// centred in the content column, so it can never overlap regardless of
+// which label is bold/active.
 static void drawV2TabBar() {
   const char* names[4] = {"Home", "Weather", "Bus", "Status"};
-  int btnW = SCREEN_W / 4;
+  const int gap = 10;
 
-  tft.fillRect(0, HOME2_TABBAR_Y, SCREEN_W, HOME2_TABBAR_H, COL_BG);
+  tft.fillRect(0, V2_TABBAR_Y0, SCREEN_W, SCREEN_H - V2_TABBAR_Y0, COL_BG);
 
+  int widths[4];
+  int totalW = 0;
   for (int i = 0; i < 4; i++) {
     bool active = ((int)currentPage == i);
-    int cx = i * btnW + btnW / 2;
-    int ty = HOME2_TABBAR_Y + 10;
+    tft.setFreeFont(active ? &F_BODY_BOLD : &F_BODY_REG);
+    widths[i] = tft.textWidth(names[i]);
+    tft.setFreeFont(NULL);
+    totalW += widths[i];
+    if (i > 0) totalW += gap;
+  }
 
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextFont(2);
+  tft.setTextDatum(TL_DATUM);
+  int cx = V2_MARGIN_L + (V2_CONTENT_W - totalW) / 2;
+  for (int i = 0; i < 4; i++) {
+    bool active = ((int)currentPage == i);
+    tft.setFreeFont(active ? &F_BODY_BOLD : &F_BODY_REG);
     tft.setTextColor(active ? COL_TEXT : COL_DIM, COL_BG);
-    tft.drawString(names[i], cx, ty);
+    tft.drawString(names[i], cx, 290);
+    tft.setFreeFont(NULL);
 
     if (active) {
-      int tw = tft.textWidth(names[i]);
-      int lineY = ty + tft.fontHeight() / 2 + 4;
-      tft.drawFastHLine(cx - tw / 2, lineY, tw, COL_TEXT);
-      tft.drawFastHLine(cx - tw / 2, lineY + 1, tw, COL_TEXT);
+      tft.drawFastHLine(cx, 309, widths[i], COL_TEXT);
+      tft.drawFastHLine(cx, 310, widths[i], COL_TEXT);
     }
+    cx += widths[i] + gap;
   }
-  tft.setTextDatum(TL_DATUM);
 }
 
 
 // Weather/Bus/Status's simple page header (title + hairline divider) --
 // Home has no equivalent since its clock already fills that role.
-static void drawV2PageHeader(const String& title) {
-  tft.fillRect(0, 0, SCREEN_W, 40, COL_BG);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextFont(2);
-  tft.setTextColor(COL_TEXT, COL_BG);
-  tft.drawString(title, HOME2_MARGIN, 12);
-  tft.drawFastHLine(HOME2_MARGIN, 38, SCREEN_W - 2 * HOME2_MARGIN, COL_STROKE);
+// 24h, no leading zero -- spec's own clock example ("7:42", "19:05") and
+// the toggle target of the clock long-press. Independent of regionFormatKey
+// (date format), a separate pre-existing setting.
+static String homeClockText(const struct tm& tmValue) {
+  int hour24 = tmValue.tm_hour;
+  int minute = tmValue.tm_min;
+  char buf[12];
+  if (clockIs24h) {
+    snprintf(buf, sizeof(buf), "%d:%02d", hour24, minute);
+  } else {
+    int hour12 = hour24 % 12;
+    if (hour12 == 0) hour12 = 12;
+    snprintf(buf, sizeof(buf), "%d:%02d %s", hour12, minute, hour24 >= 12 ? "PM" : "AM");
+  }
+  return String(buf);
 }
 
 
-static void drawHomeV2Header(bool force) {
+// Home's own sun-time format -- always 24h, no leading zero, matching the
+// spec's literal "Sunrise 6:59 · Sunset 19:05" example regardless of the
+// clock's 12h/24h toggle (that toggle is scoped to the clock element only,
+// per "Interactions").
+static String homeMinuteOfDayText(int minOfDay) {
+  if (minOfDay < 0) return "--:--";
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d:%02d", minOfDay / 60, minOfDay % 60);
+  return String(buf);
+}
+
+
+// Spec "Home" > "Layout": clock, TUE/17/NOV calendar stack, sun line + W47,
+// hairline at y100. No bold F_SMALL asset exists (Type scale only
+// generated one F_SMALL weight) -- the month's "caps Bold ink" is drawn at
+// ink colour in the same (non-bold) F_SMALL weight, the closest available
+// approximation; flagged in PROJECT_LOG.
+static void drawHomeHeader(bool force) {
   time_t now = time(nullptr);
   struct tm tmNow;
   localtime_r(&now, &tmNow);
 
-  String timeBuf = formatClockParts(tmNow, false);
-  char dayNameBuf[8];
-  strftime(dayNameBuf, sizeof(dayNameBuf), "%a", &tmNow);
-  String dayName = String(dayNameBuf);
-  String dayNum = String(tmNow.tm_mday);
+  // Spec "Hardening" > "Edge cases": "NTP not yet synced (show '--:--')."
+  // epoch values before ~2023 mean NTP hasn't landed yet (same sanity
+  // threshold waitForNtpTime() uses at boot) -- the whole header shows
+  // placeholders rather than a misleading 1970 date.
+  bool synced = timeIsSynced();
 
-  String sunLine = "Sunrise " + formatMinuteOfDay(sunriseMin) + "  -  Sunset " + formatMinuteOfDay(sunsetMin);
+  String timeBuf = synced ? homeClockText(tmNow) : "--:--";
+  String dayName, monthName, weekLine;
+  String dayNum = synced ? String(tmNow.tm_mday) : "--";
+  if (synced) {
+    char dayNameBuf[8];
+    strftime(dayNameBuf, sizeof(dayNameBuf), "%a", &tmNow);
+    dayName = String(dayNameBuf);
+    char monthBuf[8];
+    strftime(monthBuf, sizeof(monthBuf), "%b", &tmNow);
+    monthName = String(monthBuf);
+    weekLine = "W" + weekNumberText();
+  } else {
+    dayName = "---";
+    monthName = "---";
+    weekLine = "W--";
+  }
 
-  String combined = timeBuf + "|" + dayName + "|" + dayNum + "|" + sunLine + "|" +
+  String sunLine = "Sunrise " + homeMinuteOfDayText(sunriseMin) + " " +
+                    (char)0xC2 + (char)0xB7 + " Sunset " + homeMinuteOfDayText(sunsetMin);
+
+  String combined = timeBuf + "|" + dayName + "|" + dayNum + "|" + monthName + "|" +
+                     sunLine + "|" + weekLine + "|" +
                      String(COL_BG) + "|" + String(COL_TEXT) + "|" + String(COL_DIM) + "|" + String(COL_STROKE);
   if (!force && combined == cacheClock) return;
   cacheClock = combined;
 
-  tft.fillRect(0, 0, SCREEN_W, HOME2_GRID_Y1, COL_BG);
-
-  // Clock: digits/colon in the big bold font, any AM/PM suffix in font 1.
-  int splitAt = timeBuf.lastIndexOf(' ');
-  String clockMain = splitAt > 0 ? timeBuf.substring(0, splitAt) : timeBuf;
-  String clockSuffix = splitAt > 0 ? timeBuf.substring(splitAt + 1) : "";
+  tft.fillRect(0, 0, SCREEN_W, 100, COL_BG);
 
   tft.setTextDatum(TL_DATUM);
-  tft.setFreeFont(&InterBlackBig);
+  tft.setFreeFont(&F_DISPLAY);
   tft.setTextColor(COL_TEXT, COL_BG);
-  tft.drawString(clockMain, HOME2_MARGIN, HOME2_CLOCK_Y);
-  int clockW = tft.textWidth(clockMain);
+  tft.drawString(timeBuf, V2_MARGIN_L, 10);
   tft.setFreeFont(NULL);
-  if (clockSuffix.length() > 0) {
-    tft.setTextFont(1);
-    tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString(clockSuffix, HOME2_MARGIN + clockW + 6, HOME2_CLOCK_Y + 40);
+
+  drawSmallCapsLabel(dayName, V2_MARGIN_R, 14, TR_DATUM, COL_DIM, COL_BG);
+
+  tft.setFreeFont(&F_TITLE);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.drawString(dayNum, V2_MARGIN_R, 30);
+  tft.setFreeFont(NULL);
+  tft.setTextDatum(TL_DATUM);
+
+  drawSmallCapsLabel(monthName, V2_MARGIN_R, 56, TR_DATUM, COL_TEXT, COL_BG);
+
+  tft.setFreeFont(&F_BODY_REG);
+  drawTextWithDegree(V2_MARGIN_L, 76, sunLine, COL_DIM, COL_BG);
+  tft.setFreeFont(NULL);
+
+  drawSmallCapsLabel(weekLine, V2_MARGIN_R, 78, TR_DATUM, COL_DIM, COL_BG);
+
+  tft.drawFastHLine(V2_MARGIN_L, 100, V2_CONTENT_W, COL_STROKE);
+}
+
+
+// Spec "Home" > "Layout"/"Components": Tile (104x64) -- label F_SMALL caps
+// muted at y+0, value F_NUM at y+16 (ink unless valueColor overrides it,
+// e.g. accent for "Arr"), sub-line F_SMALL muted (plain case, not tracked)
+// at y+52.
+static void drawHomeTileValue(int x, int y, const String& value, uint16_t valueColor) {
+  tft.setFreeFont(&F_NUM);
+  drawTextWithDegree(x, y, value, valueColor, COL_BG);
+  tft.setFreeFont(NULL);
+}
+
+
+static void drawHomeTileSub(int x, int y, const String& sub) {
+  if (sub.length() == 0) return;
+  tft.setFreeFont(&F_SMALL);
+  drawTextWithDegree(x, y, sub, COL_DIM, COL_BG);
+  tft.setFreeFont(NULL);
+}
+
+
+// Bus tile value gets its own drawer: a numeric ETA has an F_BODY Bold
+// "min" unit baseline-aligned 3px after it (spec "Components" > "Tile");
+// "Arr"/"~3"/"-" have no numeric-prefix split and are drawn as one token.
+static void drawHomeBusValue(int x, int y, const String& value, uint16_t valueColor) {
+  String numPart, restPart;
+  splitNumericPrefix(value, numPart, restPart);
+
+  int cx = x;
+  tft.setTextDatum(TL_DATUM);
+  if (numPart.length() > 0) {
+    tft.setFreeFont(&F_NUM);
+    tft.setTextColor(valueColor, COL_BG);
+    tft.drawString(numPart, cx, y);
+    cx += tft.textWidth(numPart);
+    tft.setFreeFont(NULL);
+    if (restPart.length() > 0) {
+      tft.setFreeFont(&F_BODY_BOLD);
+      tft.setTextColor(valueColor, COL_BG);
+      tft.drawString(restPart, cx + 3, y + 10);
+      tft.setFreeFont(NULL);
+    }
+  } else {
+    tft.setFreeFont(&F_NUM);
+    drawTextWithDegree(cx, y, restPart, valueColor, COL_BG);
+    tft.setFreeFont(NULL);
+  }
+}
+
+
+static void drawHomeBusTile(bool force) {
+  int x, y, w, h;
+  getHomeTileRect(0, x, y, w, h);
+
+  String label = homeBusLabelText();
+  String value; uint16_t valueColor;
+  homeBusValueParts(value, valueColor, COL_ACCENT, COL_TEXT, COL_DIM);
+  String sub = homeBusSubText();
+
+  String combined = label + "|" + value + "|" + String(valueColor) + "|" + sub + "|" + String(COL_BG);
+  if (!force && combined == cacheHomeTiles[0]) return;
+  cacheHomeTiles[0] = combined;
+
+  tft.fillRect(x, y, w, h, COL_BG);
+  drawSmallCapsLabel(label, x, y, TL_DATUM, COL_DIM, COL_BG);
+  drawHomeBusValue(x, y + 16, value, valueColor);
+  drawHomeTileSub(x, y + 52, sub);
+}
+
+
+static void drawHomeOutdoorTile(bool force) {
+  int x, y, w, h;
+  getHomeTileRect(1, x, y, w, h);
+
+  String value = formatDegreeOnly(tempC);
+  String sub = tempRangeDegreeText();
+
+  String combined = value + "|" + sub + "|" + String(COL_BG) + "|" + String(COL_TEXT);
+  if (!force && combined == cacheHomeTiles[1]) return;
+  cacheHomeTiles[1] = combined;
+
+  tft.fillRect(x, y, w, h, COL_BG);
+  drawSmallCapsLabel("Outdoor", x, y, TL_DATUM, COL_DIM, COL_BG);
+  drawHomeTileValue(x, y + 16, value, COL_TEXT);
+  drawHomeTileSub(x, y + 52, sub);
+}
+
+
+static void drawHomeRainTile(bool force) {
+  int x, y, w, h;
+  getHomeTileRect(2, x, y, w, h);
+
+  String value = rainChanceText();
+  String sub = rainIntensityWord();
+
+  String combined = value + "|" + sub + "|" + String(COL_BG) + "|" + String(COL_TEXT);
+  if (!force && combined == cacheHomeTiles[2]) return;
+  cacheHomeTiles[2] = combined;
+
+  tft.fillRect(x, y, w, h, COL_BG);
+  drawSmallCapsLabel("Rain", x, y, TL_DATUM, COL_DIM, COL_BG);
+  drawHomeTileValue(x, y + 16, value, COL_TEXT);
+  drawHomeTileSub(x, y + 52, sub);
+}
+
+
+static void drawHomeTimerTile(bool force) {
+  int x, y, w, h;
+  getHomeTileRect(3, x, y, w, h);
+
+  String value = formatTimerClock(focusRemainingSec);
+  String sub = focusSubText();
+  bool accented = (focusTimerState == TIMER_RUNNING);
+  uint16_t valueColor = (focusTimerState == TIMER_PAUSED) ? COL_DIM : (accented ? COL_ACCENT : COL_TEXT);
+
+  String combined = value + "|" + sub + "|" + String(valueColor) + "|" + String(accented) + "|" + String(COL_BG);
+  if (!force && combined == cacheHomeTiles[3]) return;
+  cacheHomeTiles[3] = combined;
+
+  tft.fillRect(x, y, w, h, COL_BG);
+  drawSmallCapsLabel("Timer", x, y, TL_DATUM, COL_DIM, COL_BG);
+  drawHomeTileValue(x, y + 16, value, valueColor);
+  if (sub.length() > 0) {
+    tft.setFreeFont(&F_SMALL);
+    drawTextWithDegree(x, y + 52, sub, accented ? COL_ACCENT : COL_DIM, COL_BG);
+    tft.setFreeFont(NULL);
+  }
+}
+
+
+// Spec "Home" > "Layout": "Status whisper | hidden normally; shows
+// '● Offline · showing data from 10:21' when any feed is stale." A feed
+// counts as stale once its own interval has elapsed with no success --
+// reusing each FetchBackoff's failCount>0 as the "stale" signal keeps this
+// in sync with the same retry bookkeeping network.cpp already updates.
+// Spec "Staleness and offline": "Stale = now - lastOkEpoch > 'stale
+// after'" -- weather/PSI use 2x their own refresh interval (so changing
+// WEATHER_INTERVAL_SEC/PSI_INTERVAL_SEC keeps this in sync automatically);
+// bus uses the flat BUS_STALE_SEC, matching the Status Synced row's own
+// staleness test.
+static bool anyFeedStale(time_t& oldestFetch) {
+  bool stale = false;
+  time_t now = time(nullptr);
+  oldestFetch = now;
+
+  if (lastWeatherFetch > 0 && (now - lastWeatherFetch) > (time_t)(2 * WEATHER_INTERVAL_SEC)) {
+    stale = true;
+    oldestFetch = min(oldestFetch, lastWeatherFetch);
+  }
+  if (busStops[busActiveStopIdx].code.length() > 0 && lastBusFetchByStop[busActiveStopIdx] > 0 &&
+      (now - lastBusFetchByStop[busActiveStopIdx]) > (time_t)BUS_STALE_SEC) {
+    stale = true;
+    oldestFetch = min(oldestFetch, lastBusFetchByStop[busActiveStopIdx]);
+  }
+  return stale;
+}
+
+
+static void drawHomeOfflineWhisper(bool force) {
+  time_t oldest;
+  bool stale = anyFeedStale(oldest);
+
+  String text = "";
+  if (stale) {
+    struct tm tmOldest;
+    localtime_r(&oldest, &tmOldest);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d:%02d", tmOldest.tm_hour, tmOldest.tm_min);
+    text = String("showing data from ") + buf;
   }
 
-  // Date, top right, two lines.
-  tft.setTextDatum(TR_DATUM);
-  tft.setTextFont(1);
-  tft.setTextColor(COL_DIM, COL_BG);
-  tft.drawString(dayName, SCREEN_W - HOME2_MARGIN, HOME2_CLOCK_Y + 2);
-  tft.setTextColor(COL_TEXT, COL_BG);
-  tft.drawString(dayNum, SCREEN_W - HOME2_MARGIN, HOME2_CLOCK_Y + 16);
+  String combined = text + "|" + String(COL_ACCENT) + "|" + String(COL_BG);
+  if (!force && combined == cacheHomeEmpty1) return;
+  cacheHomeEmpty1 = combined;
+
+  tft.fillRect(V2_MARGIN_L, 258, V2_CONTENT_W, 14, COL_BG);
+  if (!stale) return;
+
+  tft.setFreeFont(&F_SMALL);
+  tft.setTextColor(COL_ACCENT, COL_BG);
   tft.setTextDatum(TL_DATUM);
-
-  tft.drawFastHLine(HOME2_MARGIN, HOME2_DIVIDER1_Y, SCREEN_W - 2 * HOME2_MARGIN, COL_STROKE);
-
-  tft.setTextFont(1);
-  tft.setTextColor(COL_DIM, COL_BG);
-  tft.drawString(sunLine, HOME2_MARGIN, HOME2_SUN_LINE_Y);
-
-  tft.drawFastHLine(HOME2_MARGIN, HOME2_DIVIDER2_Y, SCREEN_W - 2 * HOME2_MARGIN, COL_STROKE);
+  int fh = tft.fontHeight();
+  tft.fillCircle(V2_MARGIN_L + 3, 262 + fh / 2, 3, COL_ACCENT);
+  drawTextWithDegree(V2_MARGIN_L + 10, 262, String((char)0xC2) + (char)0xB7 + " " + text, COL_ACCENT, COL_BG);
+  tft.setFreeFont(NULL);
 }
 
 
@@ -1449,193 +1277,530 @@ void drawHomePageFull() {
   tft.fillScreen(COL_BG);
 
   cacheClock = "";
-  for (int i = 0; i < HOME_SLOT_COUNT; i++) {
-    cacheHomeSlots[i] = "";
-  }
+  clearHomeTileCaches();
+  cacheHomeEmpty1 = "";
 
   pageDirty = false;
   lastDrawnPage = PAGE_HOME;
 
-  drawHomeV2Header(true);
-  for (int i = 0; i < HOME_SLOT_COUNT; i++) {
-    drawHomeV2SlotWidget(i, true);
-  }
+  drawHomeHeader(true);
+  drawHomeBusTile(true);
+  drawHomeOutdoorTile(true);
+  drawHomeRainTile(true);
+  drawHomeTimerTile(true);
+  drawHomeOfflineWhisper(true);
   drawV2TabBar();
-
-  if (focusMenuOpen) drawFocusMenuOverlay(true);
-  if (customTimerEntryOpen) drawCustomTimerEntryOverlay(true);
-  if (timerDoneDialogOpen) drawTimerDoneOverlay(true);
 }
 
 
 void updateHomeDynamic() {
-  if (timerDoneDialogOpen) {
-    drawTimerDoneOverlay(false);
-    return;
-  }
+  drawHomeHeader(false);
+  drawHomeBusTile(false);
+  drawHomeOutdoorTile(false);
+  drawHomeRainTile(false);
+  drawHomeTimerTile(false);
+  drawHomeOfflineWhisper(false);
+}
 
-  if (customTimerEntryOpen) {
-    drawCustomTimerEntryOverlay(false);
-    return;
-  }
 
-  if (focusMenuOpen) {
-    drawFocusMenuOverlay(false);
-    return;
-  }
+// Spec "Weather" > "Layout": header (LOCATION_NAME + relative age), hero
+// temp/icon/condition/details, hairline, hourly-or-daily strip (toggled by
+// tapping the strip), hairline, two stat columns (PSI / UV max).
+static String weatherAgeText() {
+  if (lastWeatherFetch <= 0) return "--";
+  long ageSec = (long)(time(nullptr) - lastWeatherFetch);
+  if (ageSec < 0) ageSec = 0;
+  if (ageSec < 45) return "just now";
+  if (ageSec < 3600) return String((ageSec + 30) / 60) + " min ago";
+  return String((ageSec + 1800) / 3600) + " h ago";
+}
 
-  drawHomeV2Header(false);
-  for (int i = 0; i < HOME_SLOT_COUNT; i++) {
-    drawHomeV2SlotWidget(i, false);
-  }
+
+static String joinWithMiddot(const String& a, const String& b) {
+  if (a.length() == 0) return b;
+  if (b.length() == 0) return a;
+  return a + " " + (char)0xC2 + (char)0xB7 + " " + b;
+}
+
+
+// Spec Details row: "Feels 34° · Hum 78% · 25–31°".
+static String weatherDetailsLine() {
+  String feels = isnan(apparentTempC) ? "" : "Feels " + formatDegreeOnly(apparentTempC);
+  String hum = isnan(humidity) ? "" : "Hum " + String((int)roundf(humidity)) + "%";
+  String range = tempRangeDegreeText();
+  return joinWithMiddot(joinWithMiddot(feels, hum), range);
+}
+
+
+// Spec "times as 8p, 12a" -- always 12h/lowercase for the hourly strip,
+// independent of the region date-format setting (which only ever governed
+// the clock/date elsewhere); assumption flagged in PROJECT_LOG.
+static String hourLabel12Lower(int hour24) {
+  if (hour24 < 0) return "--";
+  int h12 = hour24 % 12;
+  if (h12 == 0) h12 = 12;
+  return String(h12) + (hour24 >= 12 ? "p" : "a");
 }
 
 
 void drawWeatherPageFull() {
   tft.fillScreen(COL_BG);
-  drawV2PageHeader("Weather");
   drawV2TabBar();
 
   pageDirty = false;
   lastDrawnPage = PAGE_WEATHER;
 
+  lastWeatherHeaderText = "";
   lastNowText = "";
   lastHourlyText = "";
   lastUvText = "";
-  lastUvLevelText = "";
   lastPsiText = "";
-  lastPsiLevelText = "";
 
-  tft.drawFastHLine(HOME2_MARGIN, WEATHER_HOURLY_Y - 6, SCREEN_W - 2 * HOME2_MARGIN, COL_STROKE);
-  tft.drawFastHLine(HOME2_MARGIN, PAGE_ROW3_Y - 6, SCREEN_W - 2 * HOME2_MARGIN, COL_STROKE);
+  tft.drawFastHLine(V2_MARGIN_L, 124, V2_CONTENT_W, COL_STROKE);
+  tft.drawFastHLine(V2_MARGIN_L, 224, V2_CONTENT_W, COL_STROKE);
 }
 
 
-static String hourLabel12(int hour24) {
-  if (hour24 < 0) return "--";
-  int h12 = hour24 % 12;
-  if (h12 == 0) h12 = 12;
-  return String(h12) + (hour24 >= 12 ? "P" : "A");
+static void drawWeatherHeader(bool force) {
+  String loc = locationName;
+  loc.toUpperCase();
+  String label = joinWithMiddot("WEATHER", loc);
+  String age = weatherAgeText();
+
+  String combined = label + "|" + age + "|" + String(COL_DIM) + "|" + String(COL_BG);
+  if (!force && combined == lastWeatherHeaderText) return;
+  lastWeatherHeaderText = combined;
+
+  tft.fillRect(0, 0, SCREEN_W, 26, COL_BG);
+  drawSmallCapsLabel(label, V2_MARGIN_L, 12, TL_DATUM, COL_DIM, COL_BG);
+
+  tft.setFreeFont(&F_SMALL);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.drawString(age, V2_MARGIN_R, 12);
+  tft.setFreeFont(NULL);
+  tft.setTextDatum(TL_DATUM);
+}
+
+
+static void drawWeatherHero(bool force) {
+  String t = formatDegreeOnly(tempC);
+  String cond = weatherConditionText(weatherCode);
+  String details = weatherDetailsLine();
+
+  String combined = t + "|" + cond + "|" + details + "|" + String(weatherCode) + "|" +
+                     String(weatherIsDay ? 1 : 0) + "|" + String(COL_TEXT) + "|" + String(COL_DIM) + "|" + String(COL_BG);
+  if (!force && combined == lastNowText) return;
+  lastNowText = combined;
+
+  tft.fillRect(0, 26, SCREEN_W, 124 - 26, COL_BG);
+
+  tft.setFreeFont(&F_DISPLAY);
+  tft.setTextDatum(TL_DATUM);
+  drawTextWithDegree(V2_MARGIN_L, 28, t, COL_TEXT, COL_BG);
+  tft.setFreeFont(NULL);
+
+  drawConditionIcon(tft, 188 + 20, 34 + 20, weatherCode, weatherIsDay, COL_TEXT, COL_DIM, COL_BG, 1.3f);
+
+  tft.setFreeFont(&F_BODY_BOLD);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.drawString(cond, V2_MARGIN_L, 88);
+  tft.setFreeFont(NULL);
+
+  tft.setFreeFont(&F_BODY_REG);
+  drawTextWithDegree(V2_MARGIN_L, 104, details, COL_DIM, COL_BG);
+  tft.setFreeFont(NULL);
+}
+
+
+// Spec "Hourly column": centre cx = 12 + 36i + 18. Reused at a narrower
+// 43px pitch for the 5-day view (same anatomy, day name/max-temp instead
+// of time/current-temp, per "Tap the strip: 5-day view").
+static void drawWeatherStripColumn(int cx, const String& topLabel, bool topBold, int code, bool isDay,
+                                     const String& tempLabel, int chancePercent) {
+  tft.setFreeFont(&F_SMALL);
+  tft.setTextColor(topBold ? COL_TEXT : COL_DIM, COL_BG);
+  int tw = measureTextWithGlyphs(topLabel);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString(topLabel, cx - tw / 2, 132);
+  tft.setFreeFont(NULL);
+
+  drawConditionIcon(tft, cx, 148 + 8, code, isDay, COL_TEXT, COL_DIM, COL_BG, 0.55f);
+
+  tft.setFreeFont(&F_BODY_BOLD);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  drawTextWithGlyphsCentered(cx, 168, tempLabel, COL_TEXT, COL_BG);
+  tft.setFreeFont(NULL);
+
+  drawRainBar(cx, 186, chancePercent, COL_STROKE, COL_ACCENT, COL_BG);
+
+  tft.setFreeFont(&F_SMALL);
+  String pct = chancePercent < 0 ? "--%" : String(chancePercent) + "%";
+  drawTextWithGlyphsCentered(cx, 208, pct, COL_DIM, COL_BG);
+  tft.setFreeFont(NULL);
+}
+
+
+static String dailyDayName(int ymd) {
+  if (ymd < 0) return "--";
+  struct tm tmDay = {};
+  tmDay.tm_year = (ymd / 10000) - 1900;
+  tmDay.tm_mon = ((ymd / 100) % 100) - 1;
+  tmDay.tm_mday = ymd % 100;
+  tmDay.tm_hour = 12;
+  mktime(&tmDay); // normalizes and fills tm_wday
+  char buf[8];
+  strftime(buf, sizeof(buf), "%a", &tmDay);
+  return String(buf);
+}
+
+
+static void drawWeatherStrip(bool force) {
+  String combined = String(weatherShowDaily ? 1 : 0) + "|" + String(hourlyFilled) + "|" + String(dailyFilled);
+  if (weatherShowDaily) {
+    for (int i = 1; i < dailyFilled; i++) {
+      combined += "|" + String(dailyYmd[i]) + ":" + String(dailyWeatherCode[i]) + ":" +
+                  String((int)roundf(dailyTempMaxC[i])) + ":" + String(dailyPrecipProbMax[i]);
+    }
+  } else {
+    for (int i = 0; i < hourlyFilled; i++) {
+      combined += "|" + String(hourlyHour[i]) + ":" + String(hourlyCode[i]) + ":" +
+                  String((int)roundf(hourlyTempC[i])) + ":" + String(hourlyPrecipProb[i]) + ":" + String(hourlyIsDay[i] ? 1 : 0);
+    }
+  }
+  combined += "|" + String(COL_TEXT) + "|" + String(COL_ACCENT);
+  if (!force && combined == lastHourlyText) return;
+  lastHourlyText = combined;
+
+  tft.fillRect(V2_MARGIN_L, 126, V2_CONTENT_W, 224 - 126, COL_BG);
+
+  if (weatherShowDaily) {
+    int n = dailyFilled - 1; // index 0 is today -- the 5-day view shows the next 5 days
+    if (n > 5) n = 5;
+    if (n <= 0) {
+      tft.setTextDatum(MC_DATUM);
+      tft.setFreeFont(&F_BODY_REG);
+      tft.setTextColor(COL_DIM, COL_BG);
+      tft.drawString("No daily data yet", SCREEN_W / 2, 170);
+      tft.setFreeFont(NULL);
+      tft.setTextDatum(TL_DATUM);
+      return;
+    }
+    const int colW = V2_CONTENT_W / 5;
+    for (int i = 0; i < n; i++) {
+      int srcIdx = i + 1;
+      int cx = V2_MARGIN_L + colW * i + colW / 2;
+      drawWeatherStripColumn(cx, dailyDayName(dailyYmd[srcIdx]), false, dailyWeatherCode[srcIdx], true,
+                              formatDegreeOnly(dailyTempMaxC[srcIdx]), dailyPrecipProbMax[srcIdx]);
+    }
+  } else {
+    if (hourlyFilled == 0) {
+      tft.setTextDatum(MC_DATUM);
+      tft.setFreeFont(&F_BODY_REG);
+      tft.setTextColor(COL_DIM, COL_BG);
+      tft.drawString("No hourly data yet", SCREEN_W / 2, 170);
+      tft.setFreeFont(NULL);
+      tft.setTextDatum(TL_DATUM);
+      return;
+    }
+    const int colW = V2_CONTENT_W / HOURLY_COUNT;
+    for (int i = 0; i < hourlyFilled; i++) {
+      int cx = V2_MARGIN_L + colW * i + colW / 2;
+      String label = (i == 0) ? "Now" : hourLabel12Lower(hourlyHour[i]);
+      drawWeatherStripColumn(cx, label, i == 0, hourlyCode[i], hourlyIsDay[i],
+                              formatDegreeOnly(hourlyTempC[i]), hourlyPrecipProb[i]);
+    }
+  }
+}
+
+
+static void drawWeatherStatColumn(int x, const String& label, const String& value, const String& word, bool accent) {
+  tft.fillRect(x, 232, 104, V2_TABBAR_Y0 - 232, COL_BG);
+  drawSmallCapsLabel(label, x, 232, TL_DATUM, COL_DIM, COL_BG);
+
+  tft.setFreeFont(&F_TITLE);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(accent ? COL_ACCENT : COL_TEXT, COL_BG);
+  int vw = tft.textWidth(value);
+  tft.drawString(value, x, 246);
+  tft.setFreeFont(NULL);
+
+  tft.setFreeFont(&F_BODY_REG);
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.drawString(word, x + vw + 6, 246 + 9);
+  tft.setFreeFont(NULL);
+}
+
+
+static void drawWeatherStats(bool force) {
+  String uKey = isnan(psiValue) ? "--" : String((int)roundf(psiValue));
+  bool psiAccent;
+  String uWord = psiLevelWord(psiValue, psiAccent);
+  String psiCombined = uKey + "|" + uWord + "|" + String(psiAccent) + "|" + String(COL_BG);
+  if (force || psiCombined != lastPsiText) {
+    lastPsiText = psiCombined;
+    drawWeatherStatColumn(V2_MARGIN_L, "Air " + String((char)0xC2) + (char)0xB7 + " PSI", uKey, uWord, psiAccent);
+  }
+
+  String mKey = isnan(uvIndexMax) ? "--" : String((int)roundf(uvIndexMax));
+  String mWord = uvLevelWord(uvIndexMax);
+  String uvCombined = mKey + "|" + mWord + "|" + String(COL_BG);
+  if (force || uvCombined != lastUvText) {
+    lastUvText = uvCombined;
+    drawWeatherStatColumn(124, "UV max", mKey, mWord, false);
+  }
 }
 
 
 void updateWeatherDynamic() {
-  String t = formatDegreeOnly(tempC);
-  String cond = weatherConditionText(weatherCode);
-  String feels = apparentTempText();
-  String tr = tempRangeDegreeText();
-  String r = "Rain " + rainText();
-  String nowCombined = t + "|" + cond + "|" + feels + "|" + tr + "|" + r + "|" +
-                        String(weatherCode) + "|" + String(weatherIsDay ? 1 : 0) + "|" +
-                        String(COL_TEXT) + "|" + String(COL_BG);
+  drawWeatherHeader(false);
+  drawWeatherHero(false);
+  drawWeatherStrip(false);
+  drawWeatherStats(false);
+}
 
-  if (nowCombined != lastNowText) {
-    tft.fillRect(HOME2_MARGIN, WEATHER_NOW_Y, SCREEN_W - 2 * HOME2_MARGIN, WEATHER_NOW_H - 10, COL_BG);
 
-    drawConditionIcon(tft, HOME2_MARGIN + 20, WEATHER_NOW_Y + 32, weatherCode, weatherIsDay, COL_TEXT, COL_DIM, COL_BG);
+// Spec "Tap the strip: 5-day view": tapping y 124-224 toggles hourly/daily.
+bool handleWeatherTouch(int x, int y) {
+  (void)x;
+  if (currentPage != PAGE_WEATHER) return false;
+  if (y < 124 || y >= 224) return false;
 
-    tft.setFreeFont(&InterBlackMed);
-    drawTextWithDegree(HOME2_MARGIN + 50, WEATHER_NOW_Y, t, COL_TEXT, COL_BG);
-    tft.setFreeFont(NULL);
+  weatherShowDaily = !weatherShowDaily;
+  lastHourlyText = "";
+  pageDirty = true;
+  return true;
+}
 
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextFont(1);
-    tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString(cond, HOME2_MARGIN + 50, WEATHER_NOW_Y + 32);
-    if (feels.length() > 0) tft.drawString(feels, HOME2_MARGIN + 50, WEATHER_NOW_Y + 46);
 
-    tft.setTextColor(COL_DIM, COL_BG);
-    drawTextWithDegree(HOME2_COL2_X + 10, WEATHER_NOW_Y + 6, tr, COL_DIM, COL_BG);
-    tft.drawString(r, HOME2_COL2_X + 10, WEATHER_NOW_Y + 22);
 
-    lastNowText = nowCombined;
-  }
-
-  String hourlyCombined = String(hourlyFilled);
-  for (int i = 0; i < hourlyFilled; i++) {
-    hourlyCombined += "|" + String(hourlyHour[i]) + ":" + String((int)roundf(hourlyTempC[i])) +
-                       ":" + String(hourlyCode[i]) + ":" + String(hourlyIsDay[i] ? 1 : 0);
-  }
-  hourlyCombined += "|" + String(useUsRegionFormat() ? 1 : 0) + "|" + String(COL_TEXT);
-
-  if (hourlyCombined != lastHourlyText) {
-    tft.fillRect(HOME2_MARGIN, WEATHER_HOURLY_Y, SCREEN_W - 2 * HOME2_MARGIN, WEATHER_HOURLY_H - 8, COL_BG);
-
-    if (hourlyFilled == 0) {
-      tft.setTextDatum(MC_DATUM);
-      tft.setTextFont(1);
-      tft.setTextColor(COL_DIM, COL_BG);
-      tft.drawString("No hourly data yet", SCREEN_W / 2, WEATHER_HOURLY_Y + 22);
-      tft.setTextDatum(TL_DATUM);
-    } else {
-      const int rowW = SCREEN_W - 2 * HOME2_MARGIN;
-      const int colW = rowW / HOURLY_COUNT;
-      for (int i = 0; i < hourlyFilled; i++) {
-        int colCx = HOME2_MARGIN + colW * i + colW / 2;
-
-        String hLabel = useUsRegionFormat() ? hourLabel12(hourlyHour[i]) : (String(hourlyHour[i]) + "h");
-        tft.setTextDatum(MC_DATUM);
-        tft.setTextFont(1);
-        tft.setTextColor(COL_DIM, COL_BG);
-        tft.drawString(hLabel, colCx, WEATHER_HOURLY_Y + 6);
-
-        drawConditionIcon(tft, colCx, WEATHER_HOURLY_Y + 26, hourlyCode[i], hourlyIsDay[i], COL_TEXT, COL_DIM, COL_BG);
-
-        String hTemp = formatDegreeOnly(hourlyTempC[i]);
-        tft.setTextColor(COL_TEXT, COL_BG);
-        int tw = tft.textWidth(hTemp) + 8; // + room for the manual degree ring
-        drawTextWithDegree(colCx - tw / 2, WEATHER_HOURLY_Y + 38, hTemp, COL_TEXT, COL_BG);
-      }
-      tft.setTextDatum(TL_DATUM);
+// Spec "Bus" > "Layout"/"Interactions": header (stop code, stop dots,
+// stop name, page count), four 52px rows, favourite pinned first.
+static void busGoToNextStop() {
+  for (int step = 1; step <= BUS_MAX_STOPS; step++) {
+    int idx = (busActiveStopIdx + step) % BUS_MAX_STOPS;
+    if (busStops[idx].code.length() > 0) {
+      busActiveStopIdx = idx;
+      lastBusPageText = "";
+      return;
     }
-
-    lastHourlyText = hourlyCombined;
   }
+}
 
-  bool uvValid = !isnan(uvIndex);
-  String u = uvValid ? String(uvIndex, 1) : "--";
-  String ul = uvLevelText();
-  if (u != lastUvText || ul != lastUvLevelText || dataDirty) {
-    tft.fillRect(HOME2_MARGIN, PAGE_ROW3_Y, HOME2_COL_W, PAGE_WIDGET_H, COL_BG);
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextFont(1);
-    tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString("UV INDEX", HOME2_MARGIN, PAGE_ROW3_Y);
-    drawValueWithSuffix(HOME2_MARGIN, PAGE_ROW3_Y + 14, u, &InterBlackMed, COL_TEXT, COL_BG);
-    tft.setTextFont(1);
-    tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString(ul, HOME2_MARGIN, PAGE_ROW3_Y + 50);
-    lastUvText = u;
-    lastUvLevelText = ul;
-  }
 
-  bool psiValid = !isnan(psiValue);
-  String k = psiValid ? String((int)roundf(psiValue)) : "--";
-  String kl = psiLevelText();
-  if (k != lastPsiText || kl != lastPsiLevelText || dataDirty) {
-    tft.fillRect(HOME2_COL2_X, PAGE_ROW3_Y, HOME2_COL_W, PAGE_WIDGET_H, COL_BG);
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextFont(1);
-    tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString("PSI (HAZE)", HOME2_COL2_X, PAGE_ROW3_Y);
-    drawValueWithSuffix(HOME2_COL2_X, PAGE_ROW3_Y + 14, k, &InterBlackMed, COL_TEXT, COL_BG);
-    tft.setTextFont(1);
-    tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString(kl, HOME2_COL2_X, PAGE_ROW3_Y + 50);
-    lastPsiText = k;
-    lastPsiLevelText = kl;
+// Favourite first (if present in this stop's list), then the rest in
+// their already-soonest-first fetch order. orderOut must hold at least
+// BUS_MAX_SERVICES ints.
+static void busDisplayOrder(int active, int* orderOut, int& countOut) {
+  int count = busServiceCountByStop[active];
+  countOut = count;
+  int favIdx = -1;
+  if (favBusService.length() > 0) {
+    for (int i = 0; i < count; i++) {
+      if (busServicesByStop[active][i].serviceNo == favBusService) { favIdx = i; break; }
+    }
   }
+  int w = 0;
+  if (favIdx >= 0) orderOut[w++] = favIdx;
+  for (int i = 0; i < count; i++) {
+    if (i == favIdx) continue;
+    orderOut[w++] = i;
+  }
+}
+
+
+static String busLoadWord(int pips) {
+  switch (pips) {
+    case 1: return "Seats";
+    case 2: return "Standing";
+    case 3: return "Packed";
+    default: return "";
+  }
+}
+
+
+static String busLoadLineText(const BusServiceInfo& svc) {
+  String word = busLoadWord(svc.loadPips);
+  if (word.length() == 0) return svc.vehicleType;
+  if (svc.vehicleType.length() == 0) return word;
+  return joinWithMiddot(word, svc.vehicleType);
+}
+
+
+// Spec row anatomy's ETA value: "Arr" accent at <=0min (no unit); "~N min"
+// muted when unmonitored; otherwise "N min" in accent (favourite) or ink.
+static void busEtaMainParts(const BusServiceInfo& svc, bool isFavourite, String& value, uint16_t& color,
+                              uint16_t accentColor, uint16_t inkColor, uint16_t mutedColor) {
+  int eta1 = busMinutesUntil(svc.arrival1);
+  if (!svc.monitored) {
+    value = "~" + String(eta1 < 0 ? 0 : eta1) + " min";
+    color = mutedColor;
+    return;
+  }
+  if (eta1 <= 0) { value = "Arr"; color = accentColor; return; }
+  value = String(eta1) + " min";
+  color = isFavourite ? accentColor : inkColor;
+}
+
+
+// Spec: "then 11 · 19" (minutes only); unmonitored -> "scheduled"; both
+// NextBus2/3 empty -> "last bus".
+static String busNextLineText(const BusServiceInfo& svc) {
+  if (!svc.monitored) return "scheduled";
+  int eta2 = busMinutesUntil(svc.arrival2);
+  int eta3 = busMinutesUntil(svc.arrival3);
+  if (eta2 < 0 && eta3 < 0) return "last bus";
+  String parts = "";
+  if (eta2 >= 0) parts = String(eta2);
+  if (eta3 >= 0) parts = joinWithMiddot(parts, String(eta3));
+  return "then " + parts;
 }
 
 
 void drawBusPageFull() {
   tft.fillScreen(COL_BG);
-  drawV2PageHeader("Bus");
   drawV2TabBar();
 
   pageDirty = false;
   lastDrawnPage = PAGE_BUS;
   lastBusPageText = "";
+  lastBusHeaderText = "";
+
+  tft.drawFastHLine(V2_MARGIN_L, 54, V2_CONTENT_W, COL_STROKE);
+}
+
+
+static void drawBusHeader(int active, bool force) {
+  int configuredCount = 0;
+  int activePos = -1;
+  for (int i = 0; i < BUS_MAX_STOPS; i++) {
+    if (busStops[i].code.length() == 0) continue;
+    if (i == active) activePos = configuredCount;
+    configuredCount++;
+  }
+
+  String label = busStops[active].code.length() > 0 ? ("BUS STOP " + busStops[active].code) : "BUS STOP";
+  String name = busStops[active].code.length() > 0
+                  ? (busStopDisplayName(active).length() > 0 ? busStopDisplayName(active) : ("Stop " + busStops[active].code))
+                  : "No stop configured";
+
+  int total = busServiceCountByStop[active];
+  int pageCount = (total + BUS_ROWS_PER_PAGE - 1) / BUS_ROWS_PER_PAGE;
+  String pageLabel = (pageCount > 1) ? (String(busServicePage[active] + 1) + "/" + String(pageCount)) : "";
+
+  String combined = label + "|" + name + "|" + pageLabel + "|" + String(configuredCount) + "|" + String(activePos) + "|" + String(COL_BG);
+  if (!force && combined == lastBusHeaderText) return;
+  lastBusHeaderText = combined;
+
+  tft.fillRect(0, 0, SCREEN_W, 54, COL_BG);
+  drawSmallCapsLabel(label, V2_MARGIN_L, 12, TL_DATUM, COL_DIM, COL_BG);
+
+  tft.setFreeFont(&F_HEAD);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.drawString(name, V2_MARGIN_L, 26);
+  tft.setFreeFont(NULL);
+
+  if (configuredCount > 1) {
+    int dotCount = configuredCount > 3 ? 3 : configuredCount;
+    int totalW = dotCount * 6 + (dotCount - 1) * 2;
+    int startX = V2_MARGIN_R - totalW;
+    for (int i = 0; i < dotCount; i++) {
+      int cx = startX + i * 8 + 3;
+      tft.fillCircle(cx, 14 + 3, 3, (i == activePos) ? COL_TEXT : COL_STROKE);
+    }
+  }
+
+  if (pageLabel.length() > 0) {
+    tft.setFreeFont(&F_SMALL);
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(COL_DIM, COL_BG);
+    tft.drawString(pageLabel, V2_MARGIN_R, 30);
+    tft.setFreeFont(NULL);
+    tft.setTextDatum(TL_DATUM);
+  }
+}
+
+
+static void drawBusRow(int rowTop, const BusServiceInfo& svc, bool isFavourite, bool drawHairline) {
+  tft.fillRect(V2_MARGIN_L, rowTop, V2_CONTENT_W, BUS_ROW_H - 1, COL_BG);
+
+  tft.setFreeFont(&F_NUM);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(isFavourite ? COL_ACCENT : COL_TEXT, COL_BG);
+  tft.drawString(svc.serviceNo, V2_MARGIN_L, rowTop + 8);
+  tft.setFreeFont(NULL);
+
+  int pipsX = V2_MARGIN_L;
+  int pipsY = rowTop + 36;
+  for (int p = 0; p < 3; p++) {
+    int px = pipsX + p * 9;
+    tft.drawRect(px, pipsY + 3, 6, 6, COL_DIM);
+    if (p < svc.loadPips) tft.fillRect(px, pipsY + 3, 6, 6, COL_DIM);
+  }
+  String loadLine = busLoadLineText(svc);
+  if (loadLine.length() > 0) {
+    tft.setFreeFont(&F_SMALL);
+    tft.setTextColor(COL_DIM, COL_BG);
+    tft.drawString(loadLine, pipsX + 3 * 9 + 4, pipsY);
+    tft.setFreeFont(NULL);
+  }
+
+  String etaValue; uint16_t etaColor;
+  busEtaMainParts(svc, isFavourite, etaValue, etaColor, COL_ACCENT, COL_TEXT, COL_DIM);
+  // Numeric prefix in F_NUM, "min" unit in F_BODY Bold baseline-aligned --
+  // "Arr" has no numeric prefix and is drawn as one F_NUM token.
+  String numPart, restPart;
+  splitNumericPrefix(etaValue, numPart, restPart);
+  tft.setTextDatum(TR_DATUM);
+  if (numPart.length() > 0) {
+    tft.setFreeFont(&F_BODY_BOLD);
+    tft.setTextColor(etaColor, COL_BG);
+    int unitW = restPart.length() > 0 ? tft.textWidth(restPart) + 3 : 0;
+    tft.setFreeFont(&F_NUM);
+    int numW = tft.textWidth(numPart);
+    tft.setFreeFont(NULL);
+    tft.setTextDatum(TL_DATUM);
+    int startX = V2_MARGIN_R - unitW - numW;
+    tft.setFreeFont(&F_NUM);
+    tft.setTextColor(etaColor, COL_BG);
+    tft.drawString(numPart, startX, rowTop + 8);
+    tft.setFreeFont(NULL);
+    if (restPart.length() > 0) {
+      tft.setFreeFont(&F_BODY_BOLD);
+      tft.drawString(restPart, startX + numW + 3, rowTop + 8 + 10);
+      tft.setFreeFont(NULL);
+    }
+  } else {
+    tft.setFreeFont(&F_NUM);
+    tft.setTextColor(etaColor, COL_BG);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(restPart, V2_MARGIN_R, rowTop + 8);
+    tft.setFreeFont(NULL);
+  }
+  tft.setTextDatum(TL_DATUM);
+
+  String nextLine = busNextLineText(svc);
+  tft.setFreeFont(&F_SMALL);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.drawString(nextLine, V2_MARGIN_R, rowTop + 36);
+  tft.setFreeFont(NULL);
+  tft.setTextDatum(TL_DATUM);
+
+  if (drawHairline) {
+    tft.drawFastHLine(V2_MARGIN_L, rowTop + BUS_ROW_H - 1, V2_CONTENT_W, COL_STROKE);
+  }
+}
+
+
+static String busTimeOfDayText(time_t t) {
+  if (t <= 0) return "--:--";
+  struct tm tmT;
+  localtime_r(&t, &tmT);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d:%02d", tmT.tm_hour, tmT.tm_min);
+  return String(buf);
 }
 
 
@@ -1643,219 +1808,433 @@ void updateBusDynamic() {
   int active = busActiveStopIdx;
   if (active < 0 || active >= BUS_MAX_STOPS) active = 0;
 
-  String combined = String(active);
-  for (int i = 0; i < BUS_MAX_STOPS; i++) {
-    combined += "|" + busStops[i].code;
-  }
-  combined += "|" + busStopDisplayName(active) + "|" + String(busDataValidByStop[active] ? 1 : 0) +
-              "|" + String(busServiceCountByStop[active]) + "|" + String(busServicePage[active]);
+  drawBusHeader(active, false);
+
+  bool stale = busDataValidByStop[active] && busBackoff[active].failCount > 0;
+
+  String combined = String(active) + "|" + busStops[active].code + "|" + String(busDataValidByStop[active] ? 1 : 0) +
+                    "|" + String(busServiceCountByStop[active]) + "|" + String(busServicePage[active]) +
+                    "|" + String(favBusService) + "|" + String(stale);
   for (int i = 0; i < busServiceCountByStop[active]; i++) {
-    combined += "|" + busServicesByStop[active][i].serviceNo + ":" +
-                String(busServicesByStop[active][i].eta1) + ":" +
-                String(busServicesByStop[active][i].eta2) + ":" +
-                String(busServicesByStop[active][i].eta3);
+    const BusServiceInfo& svc = busServicesByStop[active][i];
+    combined += "|" + svc.serviceNo + ":" + String((long)svc.arrival1) + ":" + String((long)svc.arrival2) +
+                ":" + String((long)svc.arrival3) + ":" + String(svc.monitored) + ":" + String(svc.loadPips);
   }
 
-  if (combined == lastBusPageText && !dataDirty) return;
+  if (combined == lastBusPageText) return;
   lastBusPageText = combined;
 
-  tft.fillRect(HOME2_MARGIN, BUS_TAB_Y, SCREEN_W - 2 * HOME2_MARGIN, 216, COL_BG);
+  tft.fillRect(V2_MARGIN_L, BUS_ROW_Y0, V2_CONTENT_W, (BUS_ROWS_PER_PAGE * BUS_ROW_H) + 14, COL_BG);
 
-  // Stop tabs: plain text, underline for the active one -- same hit regions
-  // as before (handleBusTouch is unchanged), just no filled button boxes.
-  for (int i = 0; i < BUS_MAX_STOPS; i++) {
-    int tabX = HOME2_MARGIN + i * BUS_TAB_W;
-    int tabCx = tabX + BUS_TAB_W / 2;
-    bool configured = busStops[i].code.length() > 0;
-    bool isActive = configured && (i == active);
-
+  if (busStops[active].code.length() == 0) {
+    tft.setFreeFont(&F_HEAD);
     tft.setTextDatum(MC_DATUM);
-    tft.setTextFont(2);
-    tft.setTextColor(isActive ? COL_TEXT : COL_DIM, COL_BG);
-    String tabLabel = configured ? busStops[i].code : "+";
-    tft.drawString(tabLabel, tabCx, BUS_TAB_Y + BUS_TAB_H / 2);
-
-    if (isActive) {
-      int tw = tft.textWidth(tabLabel);
-      int lineY = BUS_TAB_Y + BUS_TAB_H - 2;
-      tft.drawFastHLine(tabCx - tw / 2, lineY, tw, COL_TEXT);
-    }
-  }
-  tft.setTextDatum(TL_DATUM);
-
-  bool activeConfigured = busStops[active].code.length() > 0;
-  if (!activeConfigured) {
-    drawWrappedTextLimited(HOME2_MARGIN, 86, SCREEN_W - 2 * HOME2_MARGIN - 6, "Tap + above to add a bus stop.", 2, COL_DIM, COL_BG, 4);
+    tft.setTextColor(COL_TEXT, COL_BG);
+    tft.drawString("No stop configured", SCREEN_W / 2, 140);
+    tft.setFreeFont(NULL);
+    tft.setFreeFont(&F_BODY_REG);
+    tft.setTextColor(COL_DIM, COL_BG);
+    tft.drawString("Add one on the settings page", SCREEN_W / 2, 164);
+    tft.setFreeFont(NULL);
+    tft.setTextDatum(TL_DATUM);
     return;
   }
 
-  String name = busStopDisplayName(active);
-  String nameLine = name.length() > 0 ? (name + " " + busStops[active].code) : ("Stop " + busStops[active].code);
-  tft.setTextColor(COL_TEXT, COL_BG);
-  tft.drawString(nameLine, HOME2_MARGIN, 80, 2);
-  tft.setTextColor(COL_DIM, COL_BG);
-  tft.drawString("Tap this tab again to edit", HOME2_MARGIN, 98, 1);
-
   if (!busDataValidByStop[active]) {
+    tft.setFreeFont(&F_BODY_REG);
+    tft.setTextDatum(MC_DATUM);
     tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString("Fetching bus times...", HOME2_MARGIN, 116, 2);
+    tft.drawString("Fetching bus times...", SCREEN_W / 2, 140);
+    tft.setFreeFont(NULL);
+    tft.setTextDatum(TL_DATUM);
     return;
   }
 
   int total = busServiceCountByStop[active];
   if (total == 0) {
+    tft.setFreeFont(&F_HEAD);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(COL_TEXT, COL_BG);
+    tft.drawString("No buses right now", SCREEN_W / 2, 140);
+    tft.setFreeFont(NULL);
+    tft.setFreeFont(&F_BODY_REG);
     tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString("No buses currently in service.", HOME2_MARGIN, 116, 2);
+    tft.drawString("Tap the header to switch stop", SCREEN_W / 2, 164);
+    tft.setFreeFont(NULL);
+    tft.setFreeFont(&F_SMALL);
+    tft.setTextColor(COL_DIM, COL_BG);
+    tft.drawString("Checked " + busTimeOfDayText(lastBusFetchByStop[active]), SCREEN_W / 2, 180);
+    tft.setFreeFont(NULL);
+    tft.setTextDatum(TL_DATUM);
     return;
   }
 
-  const int perPage = 3;
-  int pageCount = (total + perPage - 1) / perPage;
+  int order[BUS_MAX_SERVICES];
+  int count;
+  busDisplayOrder(active, order, count);
+
+  int pageCount = (count + BUS_ROWS_PER_PAGE - 1) / BUS_ROWS_PER_PAGE;
   if (busServicePage[active] >= pageCount) busServicePage[active] = 0;
-  int page = busServicePage[active];
-  int startIdx = page * perPage;
+  int startIdx = busServicePage[active] * BUS_ROWS_PER_PAGE;
 
-  for (int slot = 0; slot < perPage; slot++) {
-    int i = startIdx + slot;
-    if (i >= total) break;
-    int rowY = 112 + slot * 44;
-    BusServiceInfo& svc = busServicesByStop[active][i];
-
-    // Service numbers can contain letters (e.g. "851E") -- the digits-only
-    // custom font can't render those, so this uses the classic font4
-    // instead (still bold/prominent, just not the big custom typeface).
-    tft.setTextFont(4);
-    tft.setTextColor(COL_TEXT, COL_BG);
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString(svc.serviceNo, HOME2_MARGIN, rowY);
-    int svcW = tft.textWidth(svc.serviceNo);
-
-    String etaText = svc.eta1 <= 0 ? "Due" : String(svc.eta1) + " min";
-    drawValueWithSuffix(HOME2_MARGIN + svcW + 20, rowY, etaText, &InterBlackMed, COL_TEXT, COL_BG);
-
-    String nextText = "";
-    if (svc.eta2 >= 0) {
-      nextText += "then ";
-      nextText += (svc.eta2 <= 0) ? "due" : (String(svc.eta2) + "m");
-    }
-    if (svc.eta3 >= 0) {
-      nextText += (nextText.length() > 0 ? ", " : "then ");
-      nextText += (svc.eta3 <= 0) ? "due" : (String(svc.eta3) + "m");
-    }
-    if (nextText.length() > 0) {
-      tft.setTextFont(1);
-      tft.setTextColor(COL_DIM, COL_BG);
-      tft.drawString(nextText, HOME2_MARGIN + svcW + 20, rowY + 30);
-    }
+  for (int slot = 0; slot < BUS_ROWS_PER_PAGE; slot++) {
+    int displayIdx = startIdx + slot;
+    if (displayIdx >= count) break;
+    int svcIdx = order[displayIdx];
+    const BusServiceInfo& svc = busServicesByStop[active][svcIdx];
+    bool isFav = (favBusService.length() > 0 && svc.serviceNo == favBusService);
+    int rowTop = BUS_ROW_Y0 + slot * BUS_ROW_H;
+    bool lastVisibleRow = (slot == BUS_ROWS_PER_PAGE - 1) || (displayIdx == count - 1);
+    drawBusRow(rowTop, svc, isFav, !lastVisibleRow);
   }
 
-  if (pageCount > 1) {
-    String moreLabel = "More (" + String(page + 1) + "/" + String(pageCount) + ")";
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextFont(2);
-    tft.setTextColor(COL_TEXT, COL_BG);
-    tft.drawString(moreLabel, SCREEN_W / 2, 250);
-    int tw = tft.textWidth(moreLabel);
-    tft.drawFastHLine(SCREEN_W / 2 - tw / 2, 262, tw, COL_TEXT);
+  if (stale) {
+    tft.setFreeFont(&F_SMALL);
+    tft.setTextColor(COL_ACCENT, COL_BG);
+    int fh = tft.fontHeight();
+    tft.fillCircle(V2_MARGIN_L + 3, 268 + fh / 2, 3, COL_ACCENT);
+    drawTextWithDegree(V2_MARGIN_L + 10, 268,
+                         String((char)0xC2) + (char)0xB7 + " bus data from " + busTimeOfDayText(lastBusFetchByStop[active]),
+                         COL_ACCENT, COL_BG);
+    tft.setFreeFont(NULL);
     tft.setTextDatum(TL_DATUM);
   }
+}
+
+
+
+// Spec "Status" > "Layout": header+version, product name/owner/case swatch,
+// colourway swatches, brightness/night-mode segmented options, info rows.
+static String wifiInfoText(uint16_t& color) {
+  if (!wifiEnabled || WiFi.status() != WL_CONNECTED) {
+    color = COL_ACCENT;
+    return "Not connected";
+  }
+  color = COL_TEXT;
+  String ssid = storedWifiSsid.length() > 0 ? storedWifiSsid : WiFi.SSID();
+  return ssid + " " + (char)0xC2 + (char)0xB7 + " " + String(WiFi.RSSI()) + " dBm";
+}
+
+
+static String uptimeInfoText() {
+  return uptimeText() + " " + (char)0xC2 + (char)0xB7 + " " + String(ESP.getFreeHeap() / 1024) + " KB free";
+}
+
+
+static uint16_t currentCaseColor() {
+  const char* key; const char* label; uint16_t swatch;
+  for (int i = 0; i < shellColourCount(); i++) {
+    shellColourAt(i, &key, &label, &swatch);
+    if (shellColourKey == key) return swatch;
+  }
+  shellColourAt(0, &key, &label, &swatch);
+  return swatch;
+}
+
+
+// Spec "Components" > "Segmented option": options right-aligned at a given
+// x with 14px gaps; active Bold ink with a 2px underline 4px below.
+// computeSegmentedLayout() is shared by the drawer and the hit-tester so
+// their geometry can never drift apart.
+static void computeSegmentedLayout(int rightX, const char* const* labels, int count, int activeIdx, int* startXs, int* widths) {
+  int totalW = 0;
+  for (int i = 0; i < count; i++) {
+    tft.setFreeFont(i == activeIdx ? &F_BODY_BOLD : &F_BODY_REG);
+    widths[i] = tft.textWidth(labels[i]);
+    tft.setFreeFont(NULL);
+    totalW += widths[i];
+    if (i > 0) totalW += STATUS_SEGMENTED_GAP;
+  }
+  int cx = rightX - totalW;
+  for (int i = 0; i < count; i++) {
+    startXs[i] = cx;
+    cx += widths[i] + STATUS_SEGMENTED_GAP;
+  }
+}
+
+
+static void drawSegmentedOption(int rightX, int y, const char* const* labels, int count, int activeIdx) {
+  int startXs[6], widths[6];
+  computeSegmentedLayout(rightX, labels, count, activeIdx, startXs, widths);
+
+  tft.setTextDatum(TL_DATUM);
+  for (int i = 0; i < count; i++) {
+    bool active = (i == activeIdx);
+    tft.setFreeFont(active ? &F_BODY_BOLD : &F_BODY_REG);
+    tft.setTextColor(active ? COL_TEXT : COL_DIM, COL_BG);
+    tft.drawString(labels[i], startXs[i], y);
+    tft.setFreeFont(NULL);
+    if (active) {
+      tft.drawFastHLine(startXs[i], y + 20, widths[i], COL_TEXT);
+      tft.drawFastHLine(startXs[i], y + 21, widths[i], COL_TEXT);
+    }
+  }
+}
+
+
+static int segmentedHitTest(int x, int y, int labelY, int rightX, const char* const* labels, int count, int activeIdx) {
+  if (y < labelY - 6 || y > labelY + 26) return -1;
+  int startXs[6], widths[6];
+  computeSegmentedLayout(rightX, labels, count, activeIdx, startXs, widths);
+  for (int i = 0; i < count; i++) {
+    if (x >= startXs[i] - 6 && x < startXs[i] + widths[i] + 6) return i;
+  }
+  return -1;
 }
 
 
 void drawStatusPageFull() {
   tft.fillScreen(COL_BG);
-  drawV2PageHeader("Status");
   drawV2TabBar();
 
   pageDirty = false;
   lastDrawnPage = PAGE_STATUS;
 
-  lastWifiText = "";
-  lastSignalText = "";
-  lastIpText = "";
-  lastUptimeText = "";
-  lastNetworkToggleText = "";
+  lastStatusHeaderText = "";
+  lastStatusColourwayText = "";
+  lastStatusSegmentsText = "";
+  lastStatusInfoText = "";
 
-  tft.drawFastHLine(HOME2_MARGIN, PAGE_ROW2_Y - 6, SCREEN_W - 2 * HOME2_MARGIN, COL_STROKE);
-  tft.drawFastHLine(HOME2_MARGIN, PAGE_ROW3_Y - 6, SCREEN_W - 2 * HOME2_MARGIN, COL_STROKE);
+  tft.drawFastHLine(V2_MARGIN_L, 76, V2_CONTENT_W, COL_STROKE);
+  tft.drawFastHLine(V2_MARGIN_L, 208, V2_CONTENT_W, COL_STROKE);
+}
+
+
+static void drawStatusHeader(bool force) {
+  String combined = homeTitleText() + "|" + ownerName + "|" + String(COL_BG);
+  if (!force && combined == lastStatusHeaderText) return;
+  lastStatusHeaderText = combined;
+
+  tft.fillRect(0, 0, SCREEN_W, 76, COL_BG);
+
+  drawSmallCapsLabel("STATUS", V2_MARGIN_L, 12, TL_DATUM, COL_DIM, COL_BG);
+
+  tft.setFreeFont(&F_SMALL);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.drawString(String("v") + FIRMWARE_VERSION, V2_MARGIN_R, 12);
+  tft.setFreeFont(NULL);
+  tft.setTextDatum(TL_DATUM);
+
+  tft.setFreeFont(&F_TITLE);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.drawString(homeTitleText(), V2_MARGIN_L, 26);
+  tft.setFreeFont(NULL);
+
+  if (ownerName.length() > 0) {
+    tft.setFreeFont(&F_BODY_REG);
+    tft.setTextColor(COL_DIM, COL_BG);
+    tft.drawString("Made by " + ownerName, V2_MARGIN_L, 52);
+    tft.setFreeFont(NULL);
+  }
+
+  int swatchCx = 214, swatchCy = 44, swatchR = 14;
+  tft.fillCircle(swatchCx, swatchCy, swatchR, currentCaseColor());
+  tft.drawCircle(swatchCx, swatchCy, swatchR, COL_STROKE);
+}
+
+
+static void drawStatusColourway(bool force) {
+  String combined = shellColourKey + "|" + String(COL_BG) + "|" + String(COL_TEXT);
+  if (!force && combined == lastStatusColourwayText) return;
+  lastStatusColourwayText = combined;
+
+  tft.fillRect(0, 82, SCREEN_W, 118 + STATUS_SWATCH_RING_R + 6 - 82, COL_BG);
+
+  drawSmallCapsLabel("COLOURWAY", V2_MARGIN_L, 86, TL_DATUM, COL_DIM, COL_BG);
+  drawSmallCapsLabel(shellColourLabel(shellColourKey), V2_MARGIN_R, 86, TR_DATUM, COL_TEXT, COL_BG);
+
+  int n = shellColourCount();
+  for (int i = 0; i < n; i++) {
+    const char* key; const char* label; uint16_t swatch;
+    shellColourAt(i, &key, &label, &swatch);
+    int cx = STATUS_SWATCH_X0 + i * STATUS_SWATCH_PITCH;
+    bool selected = (shellColourKey == key);
+    if (selected) {
+      tft.drawCircle(cx, STATUS_SWATCH_Y, STATUS_SWATCH_RING_R, COL_TEXT);
+      tft.drawCircle(cx, STATUS_SWATCH_Y, STATUS_SWATCH_RING_R - 1, COL_TEXT);
+    }
+    tft.fillCircle(cx, STATUS_SWATCH_Y, STATUS_SWATCH_R, swatch);
+    tft.drawCircle(cx, STATUS_SWATCH_Y, STATUS_SWATCH_R, COL_STROKE);
+  }
+}
+
+
+static const char* const BRIGHTNESS_LABELS[3] = {"Low", "Mid", "High"};
+static const char* const NIGHT_LABELS[2] = {"Off", "Auto"};
+
+
+static void drawStatusSegments(bool force) {
+  int nightIdx = (nightModeKey == "auto") ? 1 : 0;
+  String combined = String(brightnessLevel) + "|" + String(nightIdx) + "|" + String(COL_BG);
+  if (!force && combined == lastStatusSegmentsText) return;
+  lastStatusSegmentsText = combined;
+
+  tft.fillRect(0, 142, SCREEN_W, 208 - 142, COL_BG);
+
+  tft.setFreeFont(&F_BODY_REG);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString("Brightness", V2_MARGIN_L, STATUS_BRIGHTNESS_Y);
+  tft.drawString("Night mode", V2_MARGIN_L, STATUS_NIGHT_Y);
+  tft.setFreeFont(NULL);
+
+  drawSegmentedOption(V2_MARGIN_R, STATUS_BRIGHTNESS_Y, BRIGHTNESS_LABELS, 3, brightnessLevel);
+  drawSegmentedOption(V2_MARGIN_R, STATUS_NIGHT_Y, NIGHT_LABELS, 2, nightIdx);
+}
+
+
+static String formatAgeShort(long ageSec) {
+  if (ageSec < 0) return "--";
+  if (ageSec < 60) return String(ageSec) + "s";
+  if (ageSec < 3600) return String(ageSec / 60) + "m";
+  return String(ageSec / 3600) + "h";
+}
+
+
+static void drawStatusInfoRows(bool force) {
+  uint16_t wifiColor;
+  String wifi = wifiInfoText(wifiColor);
+
+  time_t now = time(nullptr);
+  long busAge = (lastBusFetchByStop[busActiveStopIdx] > 0) ? (long)(now - lastBusFetchByStop[busActiveStopIdx]) : -1;
+  long wxAge  = (lastWeatherFetch > 0) ? (long)(now - lastWeatherFetch) : -1;
+  long airAge = (lastPsiFetch > 0) ? (long)(now - lastPsiFetch) : -1;
+
+  bool syncing = forcedSyncStartedMs != 0 && (millis() - forcedSyncStartedMs < 10000);
+  String ip = ipText();
+  String uptime = uptimeInfoText();
+
+  String combined = wifi + "|" + String(syncing) + "|" + String(busAge) + "|" + String(wxAge) + "|" +
+                     String(airAge) + "|" + ip + "|" + uptime + "|" + String(COL_BG);
+  if (!force && combined == lastStatusInfoText) return;
+  lastStatusInfoText = combined;
+
+  tft.fillRect(V2_MARGIN_L, STATUS_INFO_Y0 - 2, V2_CONTENT_W, STATUS_INFO_ROW_H * 4 + 4, COL_BG);
+
+  tft.setFreeFont(&F_SMALL);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.drawString("Wi-Fi", V2_MARGIN_L, STATUS_INFO_Y0);
+  tft.drawString("Synced", V2_MARGIN_L, STATUS_INFO_Y0 + STATUS_INFO_ROW_H);
+  tft.drawString("IP", V2_MARGIN_L, STATUS_INFO_Y0 + STATUS_INFO_ROW_H * 2);
+  tft.drawString("Uptime", V2_MARGIN_L, STATUS_INFO_Y0 + STATUS_INFO_ROW_H * 3);
+  tft.setFreeFont(NULL);
+
+  tft.setFreeFont(&F_SMALL);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(wifiColor, COL_BG);
+  tft.drawString(wifi, V2_MARGIN_R, STATUS_INFO_Y0);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.drawString(ip, V2_MARGIN_R, STATUS_INFO_Y0 + STATUS_INFO_ROW_H * 2);
+  tft.drawString(uptime, V2_MARGIN_R, STATUS_INFO_Y0 + STATUS_INFO_ROW_H * 3);
+  tft.setFreeFont(NULL);
+  tft.setTextDatum(TL_DATUM);
+
+  int syncedY = STATUS_INFO_Y0 + STATUS_INFO_ROW_H;
+  if (syncing) {
+    tft.setFreeFont(&F_SMALL);
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(COL_TEXT, COL_BG);
+    tft.drawString("Syncing...", V2_MARGIN_R, syncedY);
+    tft.setFreeFont(NULL);
+    tft.setTextDatum(TL_DATUM);
+  } else {
+    // Spec "Synced": "Any feed older than 2x its refresh interval is
+    // drawn in accent" -- built right-to-left so each segment's own
+    // colour survives (a single drawString can't mix colours).
+    struct Seg { String label; String age; bool stale; };
+    Seg segs[3] = {
+      {"Bus ", formatAgeShort(busAge), busAge < 0 || busAge > (long)BUS_STALE_SEC},
+      {"Wx ",  formatAgeShort(wxAge),  wxAge  < 0 || wxAge  > (long)(2 * WEATHER_INTERVAL_SEC)},
+      {"Air ", formatAgeShort(airAge), airAge < 0 || airAge > (long)(2 * PSI_INTERVAL_SEC)},
+    };
+
+    String sep = String(" ") + (char)0xC2 + (char)0xB7 + " ";
+
+    tft.setFreeFont(&F_SMALL);
+    tft.setTextDatum(TL_DATUM);
+    int sepW = tft.textWidth(sep);
+    int totalW = 0;
+    for (int i = 0; i < 3; i++) {
+      totalW += tft.textWidth(segs[i].label) + tft.textWidth(segs[i].age);
+      if (i > 0) totalW += sepW;
+    }
+    int cx = V2_MARGIN_R - totalW;
+    for (int i = 0; i < 3; i++) {
+      if (i > 0) {
+        tft.setTextColor(COL_DIM, COL_BG);
+        tft.drawString(sep, cx, syncedY);
+        cx += sepW;
+      }
+      tft.setTextColor(COL_DIM, COL_BG);
+      tft.drawString(segs[i].label, cx, syncedY);
+      cx += tft.textWidth(segs[i].label);
+      tft.setTextColor(segs[i].stale ? COL_ACCENT : COL_TEXT, COL_BG);
+      tft.drawString(segs[i].age, cx, syncedY);
+      cx += tft.textWidth(segs[i].age);
+    }
+    tft.setFreeFont(NULL);
+  }
 }
 
 
 void updateStatusDynamic() {
-  String w = wifiStatusText();
-  if (w != lastWifiText) {
-    tft.fillRect(HOME2_MARGIN, PAGE_ROW1_Y, HOME2_COL_W, 54, COL_BG);
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextFont(1);
-    tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString("WIFI", HOME2_MARGIN, PAGE_ROW1_Y);
-    tft.setTextFont(2);
-    tft.setTextColor(statusColor(), COL_BG);
-    tft.drawString(w, HOME2_MARGIN, PAGE_ROW1_Y + 16);
-    lastWifiText = w;
-  }
-
-  String s = signalText();
-  if (s != lastSignalText) {
-    tft.fillRect(HOME2_COL2_X, PAGE_ROW1_Y, HOME2_COL_W, 54, COL_BG);
-    tft.setTextFont(1);
-    tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString("SIGNAL", HOME2_COL2_X, PAGE_ROW1_Y);
-    drawValueWithSuffix(HOME2_COL2_X, PAGE_ROW1_Y + 14, s, &InterBlackMed, COL_TEXT, COL_BG);
-    lastSignalText = s;
-  }
-
-  String ip = ipText();
-  if (ip != lastIpText) {
-    tft.fillRect(HOME2_MARGIN, PAGE_ROW2_Y, SCREEN_W - 2 * HOME2_MARGIN, 36, COL_BG);
-    tft.setTextFont(1);
-    tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString("IP ADDRESS", HOME2_MARGIN, PAGE_ROW2_Y);
-    tft.setTextFont(2);
-    tft.setTextColor(COL_TEXT, COL_BG);
-    tft.drawString(ip, HOME2_MARGIN, PAGE_ROW2_Y + 16);
-    lastIpText = ip;
-  }
-
-  String up = uptimeText();
-  String upCombined = up + "|" + lastSyncText();
-  if (upCombined != lastUptimeText) {
-    tft.fillRect(HOME2_MARGIN, PAGE_ROW3_Y, HOME2_COL_W, 54, COL_BG);
-    tft.setTextFont(1);
-    tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString("UPTIME", HOME2_MARGIN, PAGE_ROW3_Y);
-    tft.setTextFont(2);
-    tft.setTextColor(COL_TEXT, COL_BG);
-    tft.drawString(up, HOME2_MARGIN, PAGE_ROW3_Y + 16);
-    tft.setTextFont(1);
-    tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString(lastSyncText(), HOME2_MARGIN, PAGE_ROW3_Y + 40);
-    lastUptimeText = upCombined;
-  }
-
-  String networkLabel = wifiEnabled ? "Enabled" : "Disabled";
-  if (networkLabel != lastNetworkToggleText) {
-    tft.fillRect(HOME2_COL2_X, PAGE_ROW3_Y, HOME2_COL_W, 54, COL_BG);
-    tft.setTextFont(1);
-    tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString("NETWORK", HOME2_COL2_X, PAGE_ROW3_Y);
-
-    // Flat pill -- the one deliberately "buttony" affordance on this page,
-    // since it's the only actionable (non-display-only) control here.
-    int btnX = HOME2_COL2_X, btnY = PAGE_ROW3_Y + 16, btnW = HOME2_COL_W, btnH = 26;
-    if (wifiEnabled) {
-      tft.fillRoundRect(btnX, btnY, btnW, btnH, 8, COL_TEXT);
-      tft.setTextColor(COL_BG, COL_TEXT);
-    } else {
-      tft.drawRoundRect(btnX, btnY, btnW, btnH, 8, COL_STROKE);
-      tft.setTextColor(COL_DIM, COL_BG);
-    }
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString(networkLabel, btnX + btnW / 2, btnY + btnH / 2);
-    tft.setTextDatum(TL_DATUM);
-    lastNetworkToggleText = networkLabel;
-  }
+  drawStatusHeader(false);
+  drawStatusColourway(false);
+  drawStatusSegments(false);
+  drawStatusInfoRows(false);
 }
+
+
+// Spec "Status" > "Interactions": swatch -> apply colourway instantly;
+// brightness/night-mode option -> set and save; Synced row -> force sync.
+// STATUS header long-press (calibration) is handled in main.cpp via
+// touchHoldMsInRect(), not here.
+bool handleStatusTouch(int x, int y) {
+  if (currentPage != PAGE_STATUS) return false;
+
+  if (y >= STATUS_SWATCH_Y - STATUS_SWATCH_HIT && y < STATUS_SWATCH_Y + STATUS_SWATCH_HIT) {
+    int n = shellColourCount();
+    for (int i = 0; i < n; i++) {
+      int cx = STATUS_SWATCH_X0 + i * STATUS_SWATCH_PITCH;
+      if (x >= cx - STATUS_SWATCH_HIT && x < cx + STATUS_SWATCH_HIT) {
+        const char* key; const char* label; uint16_t swatch;
+        shellColourAt(i, &key, &label, &swatch);
+        applyShellColourByKey(String(key));
+        prefs.putString("shellColour", shellColourKey);
+        pageDirty = true;
+        return true;
+      }
+    }
+  }
+
+  int nightIdx = (nightModeKey == "auto") ? 1 : 0;
+  int brightHit = segmentedHitTest(x, y, STATUS_BRIGHTNESS_Y, V2_MARGIN_R, BRIGHTNESS_LABELS, 3, brightnessLevel);
+  if (brightHit >= 0) {
+    setBrightnessLevel(brightHit);
+    pageDirty = true;
+    return true;
+  }
+
+  int nightHit = segmentedHitTest(x, y, STATUS_NIGHT_Y, V2_MARGIN_R, NIGHT_LABELS, 2, nightIdx);
+  if (nightHit >= 0) {
+    nightModeKey = (nightHit == 1) ? "auto" : "off";
+    prefs.putString("nightMode", nightModeKey);
+    applyNightOverride();
+    pageDirty = true;
+    return true;
+  }
+
+  int syncedY = STATUS_INFO_Y0 + STATUS_INFO_ROW_H;
+  if (y >= syncedY - 7 && y < syncedY + 8) {
+    forceSyncAllFeeds();
+    return true;
+  }
+
+  return false;
+}
+
 
 
 void drawCurrentPageFull() {
@@ -1866,31 +2245,13 @@ void drawCurrentPageFull() {
     case PAGE_STATUS:  drawStatusPageFull(); break;
   }
 
-  if (focusMenuOpen && currentPage == PAGE_HOME) drawFocusMenuOverlay(true);
-  if (customTimerEntryOpen && currentPage == PAGE_HOME) drawCustomTimerEntryOverlay(true);
-  if (busStopEntryOpen && currentPage == PAGE_BUS) drawBusStopEntryOverlay(true);
-  if (timerDoneDialogOpen) drawTimerDoneOverlay(true);
+  if (focusTimerState == TIMER_DONE) drawTimerDoneOverlay(true);
 }
 
 
 void updateCurrentPageDynamic() {
-  if (timerDoneDialogOpen) {
+  if (focusTimerState == TIMER_DONE) {
     drawTimerDoneOverlay(false);
-    return;
-  }
-
-  if (customTimerEntryOpen && currentPage == PAGE_HOME) {
-    drawCustomTimerEntryOverlay(false);
-    return;
-  }
-
-  if (focusMenuOpen && currentPage == PAGE_HOME) {
-    drawFocusMenuOverlay(false);
-    return;
-  }
-
-  if (busStopEntryOpen && currentPage == PAGE_BUS) {
-    drawBusStopEntryOverlay(false);
     return;
   }
 
@@ -1903,213 +2264,68 @@ void updateCurrentPageDynamic() {
 }
 
 
-bool handleBusStopEntryTouch(int x, int y) {
-  if (!busStopEntryOpen) return false;
-
-  if (x < BUS_ENTRY_X || x >= BUS_ENTRY_X + BUS_ENTRY_W || y < BUS_ENTRY_Y || y >= BUS_ENTRY_Y + BUS_ENTRY_H) {
-    busStopEntryOpen = false;
-    pageDirty = true;
-    return true;
-  }
-
-  for (int r = 0; r < 4; r++) {
-    for (int c = 0; c < 3; c++) {
-      int bx, by, bw, bh;
-      busEntryKeyRect(r, c, bx, by, bw, bh);
-      if (x < bx || x >= bx + bw || y < by || y >= by + bh) continue;
-
-      const char* key = busEntryKeys[r][c];
-
-      if (strcmp(key, "Del") == 0) {
-        if (busStopEntryDigits.length() > 0) busStopEntryDigits.remove(busStopEntryDigits.length() - 1);
-        cacheBusStopEntry = "";
-        pageDirty = true;
-        return true;
-      }
-
-      if (strcmp(key, "OK") == 0) {
-        int idx = busStopEntryTargetIdx;
-        if (idx >= 0 && idx < BUS_MAX_STOPS) {
-          String newCode = busStopEntryDigits;
-          bool codeChanged = (busStops[idx].code != newCode);
-          busStops[idx].code = newCode;
-          if (newCode.length() == 0) {
-            busStops[idx].label = "";
-            busStops[idx].svcFilter = "";
-          }
-
-          if (codeChanged) {
-            busStopNames[idx] = BusStopNameInfo();
-            busDataValidByStop[idx] = false;
-            busServiceCountByStop[idx] = 0;
-            lastBusFetchByStop[idx] = 0;
-            busServicePage[idx] = 0;
-          }
-
-          prefs.putString((String("busCode") + String(idx)).c_str(), busStops[idx].code);
-          prefs.putString((String("busLabel") + String(idx)).c_str(), busStops[idx].label);
-          prefs.putString((String("busName") + String(idx)).c_str(), "");
-          prefs.putString((String("busRoad") + String(idx)).c_str(), "");
-
-          if (newCode.length() > 0) {
-            busActiveStopIdx = idx;
-          } else if (idx == busActiveStopIdx) {
-            for (int j = 0; j < BUS_MAX_STOPS; j++) {
-              if (busStops[j].code.length() > 0) { busActiveStopIdx = j; break; }
-            }
-          }
-        }
-
-        busStopEntryOpen = false;
-        cacheBusStopEntry = "";
-        lastBusPageText = "";
-        pageDirty = true;
-        return true;
-      }
-
-      if (busStopEntryDigits.length() < 6) {
-        busStopEntryDigits += key;
-        cacheBusStopEntry = "";
-        pageDirty = true;
-      }
-      return true;
-    }
-  }
-
-  return true;
-}
 
 
-bool handleCustomTimerEntryTouch(int x, int y) {
-  if (!customTimerEntryOpen) return false;
-
-  if (x < TIMER_MENU_X || x >= TIMER_MENU_X + TIMER_MENU_W || y < TIMER_MENU_Y || y >= TIMER_MENU_Y + TIMER_MENU_H) {
-    customTimerEntryOpen = false;
-    focusMenuOpen = false;
-    cacheTimerMenu = "";
-    pageDirty = true;
-    return true;
-  }
-
-  const int stepBtnW = 40;
-  const int stepBtnH = 30;
-  const int stepY = TIMER_MENU_Y + 96;
-  const int stepGap = 4;
-  const int stepXs[4] = {
-    TIMER_MENU_X + 14,
-    TIMER_MENU_X + 14 + (stepBtnW + stepGap),
-    TIMER_MENU_X + 14 + 2 * (stepBtnW + stepGap),
-    TIMER_MENU_X + 14 + 3 * (stepBtnW + stepGap)
-  };
-  const int stepDeltas[4] = {-5, -1, 1, 5};
-
-  for (int i = 0; i < 4; i++) {
-    if (x >= stepXs[i] && x < stepXs[i] + stepBtnW && y >= stepY && y < stepY + stepBtnH) {
-      customTimerMinutes = sanitizeTimerMinutes(customTimerMinutes + stepDeltas[i]);
-      cacheCustomTimer = "";
-      pageDirty = true;
-      return true;
-    }
-  }
-
-  const int actionY = TIMER_MENU_Y + 160;
-  const int actionH = 26;
-  const int cancelX = TIMER_MENU_X + 14;
-  const int startX = TIMER_MENU_X + 106;
-  const int actionBtnW = 80;
-
-  if (x >= cancelX && x < cancelX + actionBtnW && y >= actionY - 4 && y < actionY - 4 + actionH) {
-    customTimerEntryOpen = false;
-    cacheTimerMenu = "";
-    pageDirty = true;
-    return true;
-  }
-
-  if (x >= startX && x < startX + actionBtnW && y >= actionY - 4 && y < actionY - 4 + actionH) {
-    startFocusTimer(customTimerMinutes);
-    customTimerEntryOpen = false;
-    pageDirty = true;
-    return true;
-  }
-
-  return true;
-}
-
-
-bool handleFocusMenuTouch(int x, int y) {
-  if (!focusMenuOpen) return false;
-
-  if (x < TIMER_MENU_X || x >= TIMER_MENU_X + TIMER_MENU_W || y < TIMER_MENU_Y || y >= TIMER_MENU_Y + TIMER_MENU_H) {
-    focusMenuOpen = false;
-    cacheTimerMenu = "";
-    pageDirty = true;
-    return true;
-  }
-
-  struct ButtonHit {
-    int x;
-    int y;
-    int w;
-    int h;
-    int minutes;
-  };
-
-  const ButtonHit buttons[] = {
-    {34, 124, 74, 28, timerPresetMin[0]},
-    {132, 124, 74, 28, timerPresetMin[1]},
-    {34, 158, 74, 28, timerPresetMin[2]},
-    {132, 158, 74, 28, timerPresetMin[3]},
-    {34, 192, 74, 28, timerPresetMin[4]},
-    {132, 192, 74, 28, timerPresetMin[5]}
-  };
-
-  for (const ButtonHit& btn : buttons) {
-    if (x >= btn.x && x < btn.x + btn.w && y >= btn.y && y < btn.y + btn.h) {
-      startFocusTimer(btn.minutes);
-      pageDirty = true;
-      return true;
-    }
-  }
-
-  if (x >= 44 && x < 196 && y >= 224 && y < 250) {
-    if (focusTimerRunning || focusTimerFinished) {
-      resetFocusTimer();
-    } else {
-      customTimerEntryOpen = true;
-      cacheCustomTimer = "";
-    }
-    pageDirty = true;
-    return true;
-  }
-
-  return true;
-}
-
-
+// Spec "Home" > "Interactions": Bus tile -> Bus page; Outdoor/Rain tile ->
+// Weather page; Timer tile -> start/pause/resume (state.cpp's own state
+// machine); Clock has no tap action (only the long-press in
+// handleHomeLongPress() below).
 bool handleHomeTouch(int x, int y) {
   if (currentPage != PAGE_HOME) return false;
+  if (focusTimerState == TIMER_DONE) return false; // handled by handleTimerDoneDialogTouch() first
 
-  if (customTimerEntryOpen) return handleCustomTimerEntryTouch(x, y);
-  if (focusMenuOpen) return handleFocusMenuTouch(x, y);
+  int tx, ty, tw, th;
 
-  for (int slot = 0; slot < HOME_SLOT_COUNT; slot++) {
-    if (homeWidgetSlots[slot] != HOME_WIDGET_TIMER) continue;
+  getHomeTileRect(0, tx, ty, tw, th); // Bus
+  if (x >= tx && x < tx + tw && y >= ty && y < ty + th) {
+    currentPage = PAGE_BUS;
+    pageDirty = true;
+    return true;
+  }
 
-    int slotX, slotY, slotW, slotH;
-    getHomeSlotRect(slot, slotX, slotY, slotW, slotH);
+  getHomeTileRect(1, tx, ty, tw, th); // Outdoor
+  if (x >= tx && x < tx + tw && y >= ty && y < ty + th) {
+    currentPage = PAGE_WEATHER;
+    pageDirty = true;
+    return true;
+  }
 
-    if (x >= slotX && x < slotX + slotW && y >= slotY && y < slotY + slotH) {
-      if (focusTimerFinished) {
-        resetFocusTimer();
-      } else {
-        focusMenuOpen = true;
-        cacheFocusTimer = "";
-        clearHomeSlotCaches();
-        cacheTimerMenu = "";
-      }
-      pageDirty = true;
-      return true;
-    }
+  getHomeTileRect(2, tx, ty, tw, th); // Rain
+  if (x >= tx && x < tx + tw && y >= ty && y < ty + th) {
+    currentPage = PAGE_WEATHER;
+    pageDirty = true;
+    return true;
+  }
+
+  getHomeTileRect(3, tx, ty, tw, th); // Timer
+  if (x >= tx && x < tx + tw && y >= ty && y < ty + th) {
+    startOrToggleFocusTimer();
+    return true;
+  }
+
+  return false;
+}
+
+
+// Spec "Home" > "Interactions": Clock long-press toggles 12h/24h (saved).
+// Timer tile long-press: idle cycles the duration, paused resets.
+bool handleHomeLongPress(int x, int y) {
+  if (currentPage != PAGE_HOME) return false;
+  if (focusTimerState == TIMER_DONE) return false;
+
+  if (x >= HOME_CLOCK_HIT_X0 && x < HOME_CLOCK_HIT_X1 && y >= HOME_CLOCK_HIT_Y0 && y < HOME_CLOCK_HIT_Y1) {
+    saveClockIs24h(!clockIs24h);
+    cacheClock = "";
+    pageDirty = true;
+    return true;
+  }
+
+  int tx, ty, tw, th;
+  getHomeTileRect(3, tx, ty, tw, th); // Timer
+  if (x >= tx && x < tx + tw && y >= ty && y < ty + th) {
+    if (focusTimerState == TIMER_IDLE) cycleFocusDuration();
+    else if (focusTimerState == TIMER_PAUSED) resetFocusTimerToIdle();
+    return true;
   }
 
   return false;
@@ -2119,17 +2335,33 @@ bool handleHomeTouch(int x, int y) {
 bool handleTimerDoneDialogTouch(int x, int y) {
   (void)x;
   (void)y;
-  if (!timerDoneDialogOpen) return false;
-  dismissTimerDoneDialog();
+  if (focusTimerState != TIMER_DONE) return false;
+  dismissTimerDone();
   return true;
 }
 
 
-bool handleStatusTouch(int x, int y) {
-  if (currentPage != PAGE_STATUS) return false;
+// Spec "Bus" > "Interactions": header (y0-54) -> next configured stop,
+// wraps; rows area (y56-264) -> next page of four, wraps.
+bool handleBusTouch(int x, int y) {
+  (void)x;
+  if (currentPage != PAGE_BUS) return false;
 
-  if (x >= 124 && x < 232 && y >= 198 && y < 268) {
-    setWifiEnabled(!wifiEnabled);
+  if (y < 54) {
+    busGoToNextStop();
+    pageDirty = true;
+    return true;
+  }
+
+  if (y >= BUS_ROW_Y0 && y < BUS_ROW_Y0 + BUS_ROWS_PER_PAGE * BUS_ROW_H) {
+    int active = busActiveStopIdx;
+    int total = busServiceCountByStop[active];
+    int pageCount = (total + BUS_ROWS_PER_PAGE - 1) / BUS_ROWS_PER_PAGE;
+    if (pageCount > 1) {
+      busServicePage[active] = (busServicePage[active] + 1) % pageCount;
+      lastBusPageText = "";
+      pageDirty = true;
+    }
     return true;
   }
 
@@ -2137,47 +2369,31 @@ bool handleStatusTouch(int x, int y) {
 }
 
 
-bool handleBusTouch(int x, int y) {
+// Spec "Bus" > "Interactions": long-press a row -> that service becomes
+// the favourite (saved to NVS, Home updates too).
+bool handleBusLongPress(int x, int y) {
+  (void)x;
   if (currentPage != PAGE_BUS) return false;
-
-  if (busStopEntryOpen) return handleBusStopEntryTouch(x, y);
+  if (y < BUS_ROW_Y0 || y >= BUS_ROW_Y0 + BUS_ROWS_PER_PAGE * BUS_ROW_H) return false;
 
   int active = busActiveStopIdx;
-  if (active < 0 || active >= BUS_MAX_STOPS) active = 0;
-
-  if (y >= BUS_TAB_Y && y < BUS_TAB_Y + BUS_TAB_H) {
-    int i = (x - 18) / BUS_TAB_W;
-    if (i >= 0 && i < BUS_MAX_STOPS) {
-      bool configured = busStops[i].code.length() > 0;
-      if (!configured) {
-        busStopEntryOpen = true;
-        busStopEntryTargetIdx = i;
-        busStopEntryDigits = "";
-        cacheBusStopEntry = "";
-      } else if (i == active) {
-        busStopEntryOpen = true;
-        busStopEntryTargetIdx = i;
-        busStopEntryDigits = busStops[i].code;
-        cacheBusStopEntry = "";
-      } else {
-        busActiveStopIdx = i;
-        lastBusPageText = "";
-      }
-      pageDirty = true;
-      return true;
-    }
-  }
-
   int total = busServiceCountByStop[active];
-  int pageCount = (total + 2) / 3;
-  if (pageCount > 1 && x >= 20 && x < 220 && y >= 242 && y < 268) {
-    busServicePage[active] = (busServicePage[active] + 1) % pageCount;
-    lastBusPageText = "";
-    pageDirty = true;
-    return true;
-  }
+  if (total == 0) return false;
 
-  return false;
+  int order[BUS_MAX_SERVICES];
+  int count;
+  busDisplayOrder(active, order, count);
+
+  int row = (y - BUS_ROW_Y0) / BUS_ROW_H;
+  int displaySlot = busServicePage[active] * BUS_ROWS_PER_PAGE + row;
+  if (displaySlot < 0 || displaySlot >= count) return false;
+
+  favBusService = busServicesByStop[active][order[displaySlot]].serviceNo;
+  prefs.putString("favBusSvc", favBusService);
+  clearHomeTileCaches();
+  lastBusPageText = "";
+  pageDirty = true;
+  return true;
 }
 
 
@@ -2185,8 +2401,9 @@ bool handleBusTouch(int x, int y) {
 // NAVIGATION
 // =========================================================
 void handleNavTouch(int x, int y) {
-  // All four pages share the V2 tab bar now (see drawV2TabBar()).
-  if (y < HOME2_TABBAR_Y) return;
+  // Touch strip per spec: full SCREEN_W/4 columns, y >= V2_TAB_TOUCH_Y0 --
+  // wider than the visual label cells in drawV2TabBar() on purpose.
+  if (y < V2_TAB_TOUCH_Y0) return;
 
   int btnW = SCREEN_W / 4;
   int idx = x / btnW;
@@ -2194,7 +2411,50 @@ void handleNavTouch(int x, int y) {
 
   Page newPage = (Page)idx;
   if (newPage != currentPage) {
+    // Spec "Tap the strip: 5-day view": "The view resets to hourly when
+    // you leave the page" -- the only way to leave Weather is this nav tap.
+    if (currentPage == PAGE_WEATHER) weatherShowDaily = false;
     currentPage = newPage;
     pageDirty = true;
+  }
+}
+
+
+// =========================================================
+// #define COLOUR_TEST -- boot-time palette check (spec Prompt 1,
+// acceptance: "COLOUR_TEST shows all six palettes with the right colours,
+// no swapped red/blue, not inverted"). Six stripes, each stripe's own bg,
+// with ink/muted/rule/accent samples and the colourway's name. Called once
+// from setup() in place of the normal boot sequence -- no WiFi, no touch.
+// =========================================================
+void drawColourTestScreen() {
+  const int n = shellColourCount();
+  const int stripeH = SCREEN_H / n;
+
+  for (int i = 0; i < n; i++) {
+    const char* key; const char* label; uint16_t caseColor;
+    shellColourAt(i, &key, &label, &caseColor);
+    uint16_t bg, ink, muted, rule, accent;
+    colourwayRolesAt(i, &bg, &ink, &muted, &rule, &accent);
+
+    int y0 = i * stripeH;
+    int h = (i == n - 1) ? (SCREEN_H - y0) : stripeH;
+
+    tft.fillRect(0, y0, SCREEN_W, h, bg);
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setFreeFont(&F_HEAD);
+    tft.setTextColor(ink, bg);
+    tft.drawString(label, V2_MARGIN_L, y0 + 4);
+    tft.setFreeFont(NULL);
+
+    tft.setTextFont(1);
+    tft.setTextColor(muted, bg);
+    tft.drawString("muted sample", V2_MARGIN_L, y0 + h - 14);
+
+    int ruleY = y0 + h / 2 + 6;
+    tft.drawFastHLine(V2_MARGIN_L, ruleY, V2_CONTENT_W - 60, rule);
+
+    tft.fillRect(V2_MARGIN_R - 36, y0 + h / 2 - 8, 24, 24, accent);
   }
 }
