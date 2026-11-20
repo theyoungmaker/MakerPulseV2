@@ -141,6 +141,68 @@ static void splitNumericPrefix(const String& s, String& numPart, String& restPar
 }
 
 
+static void drawDegreeRing(int cx, int cy, uint16_t color) {
+  tft.drawCircle(cx, cy, 3, color);
+}
+
+
+// Draws `text` in the currently-set font, substituting a small ring for
+// the UTF-8 degree sign (0xC2 0xB0) since neither custom font contains it.
+static int drawTextWithDegree(int x, int y, const String& text, uint16_t fg, uint16_t bg) {
+  tft.setTextColor(fg, bg);
+  tft.setTextDatum(TL_DATUM);
+  int n = text.length();
+  int cx = x;
+  int i = 0;
+  String buf = "";
+
+  while (i < n) {
+    if ((uint8_t)text[i] == 0xC2 && i + 1 < n && (uint8_t)text[i + 1] == 0xB0) {
+      if (buf.length() > 0) {
+        tft.drawString(buf, cx, y);
+        cx += tft.textWidth(buf);
+        buf = "";
+      }
+      int r = 3;
+      drawDegreeRing(cx + r + 1, y + r + 1, fg);
+      cx += 2 * r + 5;
+      i += 2;
+      continue;
+    }
+    buf += text[i];
+    i++;
+  }
+  if (buf.length() > 0) {
+    tft.drawString(buf, cx, y);
+    cx += tft.textWidth(buf);
+  }
+  return cx;
+}
+
+
+// Draws a value's leading numeric run in `bigFont` (bold) and any trailing
+// letter suffix in font 1 (small) -- e.g. "3 min" -> bold "3" + small " min".
+static void drawValueWithSuffix(int x, int y, const String& value, const GFXfont* bigFont, uint16_t fg, uint16_t bg) {
+  String numPart, restPart;
+  splitNumericPrefix(value, numPart, restPart);
+
+  int cx = x;
+  tft.setTextDatum(TL_DATUM);
+  if (numPart.length() > 0) {
+    tft.setFreeFont(bigFont);
+    tft.setTextColor(fg, bg);
+    tft.drawString(numPart, cx, y);
+    cx += tft.textWidth(numPart);
+    tft.setFreeFont(NULL);
+  }
+  if (restPart.length() > 0) {
+    tft.setTextFont(1);
+    int baselineShim = 10; // font1 sits visually high next to the big font's baseline
+    drawTextWithDegree(cx + 2, y + baselineShim, restPart, fg, bg);
+  }
+}
+
+
 static String rainText() {
   if (isnan(precipMm)) return unitKey == "imperial" ? "--.--in" : "--.-mm";
 
@@ -281,9 +343,9 @@ static String apparentTempText() {
 
 
 static uint16_t statusColor() {
-  // "ink" is V2's own default text preset (see CONTEXT.md's "Colourway
-  // theme" entry) -- keeps the colored WiFi status dot, same as "standard".
-  if (textColorKey != "standard" && textColorKey != "ink") return COL_TEXT;
+  // Text color is fixed (ink) under the shell-colour system -- no custom
+  // text preset can clash with these semantic colors anymore, so the
+  // colored status dot is unconditional now.
   if (!wifiEnabled) return COL_YELLOW;
   return WiFi.status() == WL_CONNECTED ? COL_GREEN : COL_RED;
 }
@@ -955,19 +1017,22 @@ void drawHomeSlotWidget(int slot, bool force = false) {
 }
 
 
+// "Colourway theme" overlays: flat fill (no border stroke) for the content
+// region instead of a bordered floating card, text-style controls instead
+// of bordered buttons. Hit-test regions in handle*Touch() are untouched --
+// only how each control is drawn changes, not where it is.
 void drawFocusMenuOverlay(bool force) {
   String combined = String(focusTimerRunning ? 1 : 0) + "|" + String(focusTimerFinished ? 1 : 0) +
-                    "|" + String(COL_PANEL_ALT) + "|" + String(COL_PANEL) + "|" + String(COL_ACCENT);
+                    "|" + String(COL_PANEL) + "|" + String(COL_TEXT) + "|" + String(COL_BG);
   if (!force && combined == cacheTimerMenu) return;
   cacheTimerMenu = combined;
 
   tft.fillRect(0, 0, SCREEN_W, SCREEN_H, COL_BG);
-  tft.fillRoundRect(TIMER_MENU_X, TIMER_MENU_Y, TIMER_MENU_W, TIMER_MENU_H, 12, COL_PANEL_ALT);
-  tft.drawRoundRect(TIMER_MENU_X, TIMER_MENU_Y, TIMER_MENU_W, TIMER_MENU_H, 12, COL_ACCENT);
+  tft.fillRoundRect(TIMER_MENU_X, TIMER_MENU_Y, TIMER_MENU_W, TIMER_MENU_H, 12, COL_PANEL);
 
-  tft.setTextColor(COL_TEXT, COL_PANEL_ALT);
+  tft.setTextColor(COL_TEXT, COL_PANEL);
   tft.drawString("Start timer", TIMER_MENU_X + 14, TIMER_MENU_Y + 12, 2);
-  tft.setTextColor(COL_DIM, COL_PANEL_ALT);
+  tft.setTextColor(COL_DIM, COL_PANEL);
   tft.drawString("Choose a session length", TIMER_MENU_X + 14, TIMER_MENU_Y + 34, 1);
 
   const int btnW = 74;
@@ -985,44 +1050,59 @@ void drawFocusMenuOverlay(bool force) {
     labels[i] = String(timerPresetMin[i]) + " min";
   }
 
+  tft.setTextDatum(MC_DATUM);
   for (int i = 0; i < 6; i++) {
-    tft.fillRoundRect(xs[i], ys[i], btnW, btnH, 8, COL_PANEL);
-    tft.drawRoundRect(xs[i], ys[i], btnW, btnH, 8, COL_STROKE);
+    tft.setTextFont(2);
     tft.setTextColor(COL_TEXT, COL_PANEL);
-    tft.drawCentreString(labels[i].c_str(), xs[i] + btnW / 2, ys[i] + 7, 2);
+    tft.drawString(labels[i], xs[i] + btnW / 2, ys[i] + btnH / 2);
   }
+  tft.setTextDatum(TL_DATUM);
 
   const int actionY = TIMER_MENU_Y + 160;
   const int actionW = 152;
   const int actionX = TIMER_MENU_X + 24;
   const char* actionLabel = focusTimerRunning ? "Stop" : (focusTimerFinished ? "Reset" : "Custom time");
-  uint16_t actionColor = focusTimerRunning ? COL_RED : COL_ACCENT;
 
-  tft.fillRoundRect(actionX, actionY - 4, actionW, 26, 8, COL_PANEL);
-  tft.drawRoundRect(actionX, actionY - 4, actionW, 26, 8, actionColor);
-  tft.setTextColor(actionColor, COL_PANEL);
-  tft.drawCentreString(actionLabel, actionX + actionW / 2, actionY + 4, 2);
+  if (focusTimerRunning) {
+    tft.fillRoundRect(actionX, actionY - 4, actionW, 26, 8, COL_RED);
+    tft.setTextColor(COL_BG, COL_RED);
+  } else {
+    tft.fillRoundRect(actionX, actionY - 4, actionW, 26, 8, COL_TEXT);
+    tft.setTextColor(COL_BG, COL_TEXT);
+  }
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(2);
+  tft.drawString(actionLabel, actionX + actionW / 2, actionY + 9);
+  tft.setTextDatum(TL_DATUM);
 }
 
 
 void drawCustomTimerEntryOverlay(bool force) {
-  String combined = String(customTimerMinutes) + "|" + String(COL_PANEL_ALT) + "|" + String(COL_PANEL) + "|" + String(COL_ACCENT);
+  String combined = String(customTimerMinutes) + "|" + String(COL_PANEL) + "|" + String(COL_TEXT) + "|" + String(COL_BG);
   if (!force && combined == cacheCustomTimer) return;
   cacheCustomTimer = combined;
 
   tft.fillRect(0, 0, SCREEN_W, SCREEN_H, COL_BG);
-  tft.fillRoundRect(TIMER_MENU_X, TIMER_MENU_Y, TIMER_MENU_W, TIMER_MENU_H, 12, COL_PANEL_ALT);
-  tft.drawRoundRect(TIMER_MENU_X, TIMER_MENU_Y, TIMER_MENU_W, TIMER_MENU_H, 12, COL_ACCENT);
+  tft.fillRoundRect(TIMER_MENU_X, TIMER_MENU_Y, TIMER_MENU_W, TIMER_MENU_H, 12, COL_PANEL);
 
-  tft.setTextColor(COL_TEXT, COL_PANEL_ALT);
+  tft.setTextColor(COL_TEXT, COL_PANEL);
   tft.drawString("Custom timer", TIMER_MENU_X + 14, TIMER_MENU_Y + 12, 2);
-  tft.setTextColor(COL_DIM, COL_PANEL_ALT);
+  tft.setTextColor(COL_DIM, COL_PANEL);
   tft.drawString("Set your own session length", TIMER_MENU_X + 14, TIMER_MENU_Y + 34, 1);
 
+  // "min" has letters the digits-only custom font can't render -- measure
+  // each part in its real font first so the number+suffix pair can still
+  // be centered as a whole (drawValueWithSuffix itself only left-aligns).
   String valueLabel = String(customTimerMinutes) + " min";
-  tft.fillRect(TIMER_MENU_X + 14, TIMER_MENU_Y + 52, TIMER_MENU_W - 28, 30, COL_PANEL_ALT);
-  tft.setTextColor(COL_ACCENT, COL_PANEL_ALT);
-  tft.drawCentreString(valueLabel.c_str(), TIMER_MENU_X + TIMER_MENU_W / 2, TIMER_MENU_Y + 56, 4);
+  String numPart, restPart;
+  splitNumericPrefix(valueLabel, numPart, restPart);
+  tft.setFreeFont(&InterBlackMed);
+  int numW = tft.textWidth(numPart);
+  tft.setFreeFont(NULL);
+  tft.setTextFont(1);
+  int restW = tft.textWidth(restPart) + 2;
+  int numStartX = TIMER_MENU_X + TIMER_MENU_W / 2 - (numW + restW) / 2;
+  drawValueWithSuffix(numStartX, TIMER_MENU_Y + 56, valueLabel, &InterBlackMed, COL_TEXT, COL_PANEL);
 
   const int stepBtnW = 40;
   const int stepBtnH = 30;
@@ -1036,12 +1116,13 @@ void drawCustomTimerEntryOverlay(bool force) {
   };
   const char* stepLabels[4] = {"-5", "-1", "+1", "+5"};
 
+  tft.setTextDatum(MC_DATUM);
   for (int i = 0; i < 4; i++) {
-    tft.fillRoundRect(stepXs[i], stepY, stepBtnW, stepBtnH, 8, COL_PANEL);
-    tft.drawRoundRect(stepXs[i], stepY, stepBtnW, stepBtnH, 8, COL_STROKE);
+    tft.setTextFont(2);
     tft.setTextColor(COL_TEXT, COL_PANEL);
-    tft.drawCentreString(stepLabels[i], stepXs[i] + stepBtnW / 2, stepY + 8, 2);
+    tft.drawString(stepLabels[i], stepXs[i] + stepBtnW / 2, stepY + stepBtnH / 2);
   }
+  tft.setTextDatum(TL_DATUM);
 
   const int actionY = TIMER_MENU_Y + 160;
   const int actionH = 26;
@@ -1049,15 +1130,15 @@ void drawCustomTimerEntryOverlay(bool force) {
   const int startX = TIMER_MENU_X + 106;
   const int actionBtnW = 80;
 
-  tft.fillRoundRect(cancelX, actionY - 4, actionBtnW, actionH, 8, COL_PANEL);
-  tft.drawRoundRect(cancelX, actionY - 4, actionBtnW, actionH, 8, COL_STROKE);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(2);
   tft.setTextColor(COL_DIM, COL_PANEL);
-  tft.drawCentreString("Cancel", cancelX + actionBtnW / 2, actionY + 4, 2);
+  tft.drawString("Cancel", cancelX + actionBtnW / 2, actionY + 9);
 
-  tft.fillRoundRect(startX, actionY - 4, actionBtnW, actionH, 8, COL_PANEL);
-  tft.drawRoundRect(startX, actionY - 4, actionBtnW, actionH, 8, COL_ACCENT);
-  tft.setTextColor(COL_ACCENT, COL_PANEL);
-  tft.drawCentreString("Start", startX + actionBtnW / 2, actionY + 4, 2);
+  tft.fillRoundRect(startX, actionY - 4, actionBtnW, actionH, 8, COL_TEXT);
+  tft.setTextColor(COL_BG, COL_TEXT);
+  tft.drawString("Start", startX + actionBtnW / 2, actionY + 9);
+  tft.setTextDatum(TL_DATUM);
 }
 
 
@@ -1071,23 +1152,25 @@ void busEntryKeyRect(int r, int c, int& x, int& y, int& w, int& h) {
 
 void drawBusStopEntryOverlay(bool force) {
   String combined = busStopEntryDigits + "|" + String(busStopEntryTargetIdx) + "|" +
-                     String(COL_PANEL_ALT) + "|" + String(COL_PANEL) + "|" + String(COL_ACCENT);
+                     String(COL_PANEL) + "|" + String(COL_TEXT) + "|" + String(COL_BG);
   if (!force && combined == cacheBusStopEntry) return;
   cacheBusStopEntry = combined;
 
   tft.fillRect(0, 0, SCREEN_W, SCREEN_H, COL_BG);
-  tft.fillRoundRect(BUS_ENTRY_X, BUS_ENTRY_Y, BUS_ENTRY_W, BUS_ENTRY_H, 12, COL_PANEL_ALT);
-  tft.drawRoundRect(BUS_ENTRY_X, BUS_ENTRY_Y, BUS_ENTRY_W, BUS_ENTRY_H, 12, COL_ACCENT);
+  tft.fillRoundRect(BUS_ENTRY_X, BUS_ENTRY_Y, BUS_ENTRY_W, BUS_ENTRY_H, 12, COL_PANEL);
 
-  tft.setTextColor(COL_TEXT, COL_PANEL_ALT);
+  tft.setTextColor(COL_TEXT, COL_PANEL);
   tft.drawString("Bus stop code", BUS_ENTRY_X + 14, BUS_ENTRY_Y + 10, 2);
-  tft.setTextColor(COL_DIM, COL_PANEL_ALT);
+  tft.setTextColor(COL_DIM, COL_PANEL);
   tft.drawString("Enter the code, then OK", BUS_ENTRY_X + 14, BUS_ENTRY_Y + 30, 1);
 
   String displayDigits = busStopEntryDigits.length() > 0 ? busStopEntryDigits : "-----";
-  tft.fillRect(BUS_ENTRY_X + 14, BUS_ENTRY_Y + 48, BUS_ENTRY_W - 28, 30, COL_PANEL_ALT);
-  tft.setTextColor(busStopEntryDigits.length() > 0 ? COL_ACCENT : COL_DIM, COL_PANEL_ALT);
-  tft.drawCentreString(displayDigits.c_str(), BUS_ENTRY_X + BUS_ENTRY_W / 2, BUS_ENTRY_Y + 52, 4);
+  tft.setFreeFont(&InterBlackMed);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(busStopEntryDigits.length() > 0 ? COL_TEXT : COL_DIM, COL_PANEL);
+  tft.drawString(displayDigits, BUS_ENTRY_X + BUS_ENTRY_W / 2, BUS_ENTRY_Y + 63);
+  tft.setFreeFont(NULL);
+  tft.setTextDatum(TL_DATUM);
 
   for (int r = 0; r < 4; r++) {
     for (int c = 0; c < 3; c++) {
@@ -1095,12 +1178,22 @@ void drawBusStopEntryOverlay(bool force) {
       busEntryKeyRect(r, c, bx, by, bw, bh);
       bool isOk = (r == 3 && c == 2);
       bool isDel = (r == 3 && c == 0);
-      uint16_t btnColor = isOk ? COL_ACCENT : (isDel ? COL_RED : COL_STROKE);
 
-      tft.fillRoundRect(bx, by, bw, bh, 8, COL_PANEL);
-      tft.drawRoundRect(bx, by, bw, bh, 8, btnColor);
-      tft.setTextColor(isOk ? COL_ACCENT : (isDel ? COL_RED : COL_TEXT), COL_PANEL);
-      tft.drawCentreString(busEntryKeys[r][c], bx + bw / 2, by + 7, 2);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextFont(2);
+      if (isOk) {
+        tft.setTextColor(COL_TEXT, COL_PANEL);
+        tft.drawString(busEntryKeys[r][c], bx + bw / 2, by + bh / 2);
+        int tw = tft.textWidth(busEntryKeys[r][c]);
+        tft.drawFastHLine(bx + bw / 2 - tw / 2, by + bh / 2 + 10, tw, COL_TEXT);
+      } else if (isDel) {
+        tft.setTextColor(COL_RED, COL_PANEL);
+        tft.drawString(busEntryKeys[r][c], bx + bw / 2, by + bh / 2);
+      } else {
+        tft.setTextColor(COL_TEXT, COL_PANEL);
+        tft.drawString(busEntryKeys[r][c], bx + bw / 2, by + bh / 2);
+      }
+      tft.setTextDatum(TL_DATUM);
     }
   }
 }
@@ -1113,32 +1206,44 @@ void drawTimerDoneOverlay(bool force) {
   String countdown = timerDoneCountdownText();
   bool flashOn = flashModeEnabled && ((millis() / 300UL) % 2UL == 0);
   setBacklight(flashModeEnabled ? (flashOn ? FLASH_BL_HIGH : FLASH_BL_LOW) : BL_FULL);
-  String combined = elapsed + "|" + String(COL_PANEL_ALT) + "|" + String(COL_ACCENT) + "|" + String(COL_TEXT);
+  String combined = elapsed + "|" + String(COL_PANEL) + "|" + String(COL_ACCENT) + "|" + String(COL_TEXT);
   String flashKey = String(flashOn ? 1 : 0);
   if (force || combined != cacheTimerDone || flashKey != cacheTimerDoneFlash) {
     cacheTimerDone = combined;
     cacheTimerDoneFlash = flashKey;
     cacheTimerDoneCountdown = "";
 
+    // Flash mode still flips the backdrop to the accent color as an alert
+    // signal -- only the border/panel chrome is flattened away here.
     uint16_t backdrop = flashOn ? COL_ACCENT : COL_BG;
-    uint16_t panelBorder = flashOn ? TFT_WHITE : COL_ACCENT;
+    uint16_t panelBg = flashOn ? COL_ACCENT : COL_PANEL;
+    uint16_t textOnPanel = flashOn ? COL_BG : COL_TEXT;
+    uint16_t dimOnPanel = flashOn ? COL_BG : COL_DIM;
     tft.fillRect(0, 0, SCREEN_W, SCREEN_H, backdrop);
-    tft.fillRoundRect(TIMER_DONE_X, TIMER_DONE_Y, TIMER_DONE_W, TIMER_DONE_H, 12, COL_PANEL_ALT);
-    tft.drawRoundRect(TIMER_DONE_X, TIMER_DONE_Y, TIMER_DONE_W, TIMER_DONE_H, 12, panelBorder);
+    tft.fillRoundRect(TIMER_DONE_X, TIMER_DONE_Y, TIMER_DONE_W, TIMER_DONE_H, 12, panelBg);
 
-    tft.setTextColor(COL_TEXT, COL_PANEL_ALT);
-    tft.drawCentreString("Timer complete", TIMER_DONE_X + TIMER_DONE_W / 2, TIMER_DONE_Y + 14, 2);
-    tft.setTextColor(COL_ACCENT, COL_PANEL_ALT);
-    tft.drawCentreString(elapsed, TIMER_DONE_X + TIMER_DONE_W / 2, TIMER_DONE_Y + 42, 2);
-    tft.setTextColor(COL_DIM, COL_PANEL_ALT);
-    tft.drawCentreString("Tap anywhere to acknowledge", TIMER_DONE_X + TIMER_DONE_W / 2, TIMER_DONE_Y + 68, 1);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(textOnPanel, panelBg);
+    tft.drawString("Timer complete", TIMER_DONE_X + TIMER_DONE_W / 2, TIMER_DONE_Y + 18);
+    tft.setTextFont(4);
+    tft.drawString(elapsed, TIMER_DONE_X + TIMER_DONE_W / 2, TIMER_DONE_Y + 48);
+    tft.setTextFont(1);
+    tft.setTextColor(dimOnPanel, panelBg);
+    tft.drawString("Tap anywhere to acknowledge", TIMER_DONE_X + TIMER_DONE_W / 2, TIMER_DONE_Y + 70);
+    tft.setTextDatum(TL_DATUM);
   }
 
   if (force || countdown != cacheTimerDoneCountdown) {
     cacheTimerDoneCountdown = countdown;
-    tft.fillRect(TIMER_DONE_X + 28, TIMER_DONE_Y + 82, TIMER_DONE_W - 56, 12, COL_PANEL_ALT);
-    tft.setTextColor(COL_DIM, COL_PANEL_ALT);
-    tft.drawCentreString(countdown.c_str(), TIMER_DONE_X + TIMER_DONE_W / 2, TIMER_DONE_Y + 82, 1);
+    uint16_t panelBg = flashOn ? COL_ACCENT : COL_PANEL;
+    uint16_t dimOnPanel = flashOn ? COL_BG : COL_DIM;
+    tft.fillRect(TIMER_DONE_X + 28, TIMER_DONE_Y + 82, TIMER_DONE_W - 56, 12, panelBg);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(1);
+    tft.setTextColor(dimOnPanel, panelBg);
+    tft.drawString(countdown, TIMER_DONE_X + TIMER_DONE_W / 2, TIMER_DONE_Y + 82);
+    tft.setTextDatum(TL_DATUM);
   }
 }
 
@@ -1150,68 +1255,6 @@ void drawTimerDoneOverlay(bool force) {
 // untouched. Reuses the exact same backend data/helpers as the original
 // Home page -- only how it's drawn changes.
 // =========================================================
-static void drawDegreeRing(int cx, int cy, uint16_t color) {
-  tft.drawCircle(cx, cy, 3, color);
-}
-
-
-// Draws `text` in the currently-set font, substituting a small ring for
-// the UTF-8 degree sign (0xC2 0xB0) since neither custom font contains it.
-static int drawTextWithDegree(int x, int y, const String& text, uint16_t fg, uint16_t bg) {
-  tft.setTextColor(fg, bg);
-  tft.setTextDatum(TL_DATUM);
-  int n = text.length();
-  int cx = x;
-  int i = 0;
-  String buf = "";
-
-  while (i < n) {
-    if ((uint8_t)text[i] == 0xC2 && i + 1 < n && (uint8_t)text[i + 1] == 0xB0) {
-      if (buf.length() > 0) {
-        tft.drawString(buf, cx, y);
-        cx += tft.textWidth(buf);
-        buf = "";
-      }
-      int r = 3;
-      drawDegreeRing(cx + r + 1, y + r + 1, fg);
-      cx += 2 * r + 5;
-      i += 2;
-      continue;
-    }
-    buf += text[i];
-    i++;
-  }
-  if (buf.length() > 0) {
-    tft.drawString(buf, cx, y);
-    cx += tft.textWidth(buf);
-  }
-  return cx;
-}
-
-
-// Draws a value's leading numeric run in `bigFont` (bold) and any trailing
-// letter suffix in font 1 (small) -- e.g. "3 min" -> bold "3" + small " min".
-static void drawValueWithSuffix(int x, int y, const String& value, const GFXfont* bigFont, uint16_t fg, uint16_t bg) {
-  String numPart, restPart;
-  splitNumericPrefix(value, numPart, restPart);
-
-  int cx = x;
-  tft.setTextDatum(TL_DATUM);
-  if (numPart.length() > 0) {
-    tft.setFreeFont(bigFont);
-    tft.setTextColor(fg, bg);
-    tft.drawString(numPart, cx, y);
-    cx += tft.textWidth(numPart);
-    tft.setFreeFont(NULL);
-  }
-  if (restPart.length() > 0) {
-    tft.setTextFont(1);
-    int baselineShim = 10; // font1 sits visually high next to the big font's baseline
-    drawTextWithDegree(cx + 2, y + baselineShim, restPart, fg, bg);
-  }
-}
-
-
 static String homeV2Label(HomeWidgetType type) {
   String s = String(homeWidgetLabel(type));
   s.toUpperCase();
@@ -1678,12 +1721,14 @@ void updateBusDynamic() {
     int rowY = 112 + slot * 44;
     BusServiceInfo& svc = busServicesByStop[active][i];
 
-    tft.setFreeFont(&InterBlackMed);
+    // Service numbers can contain letters (e.g. "851E") -- the digits-only
+    // custom font can't render those, so this uses the classic font4
+    // instead (still bold/prominent, just not the big custom typeface).
+    tft.setTextFont(4);
     tft.setTextColor(COL_TEXT, COL_BG);
     tft.setTextDatum(TL_DATUM);
     tft.drawString(svc.serviceNo, HOME2_MARGIN, rowY);
     int svcW = tft.textWidth(svc.serviceNo);
-    tft.setFreeFont(NULL);
 
     String etaText = svc.eta1 <= 0 ? "Due" : String(svc.eta1) + " min";
     drawValueWithSuffix(HOME2_MARGIN + svcW + 20, rowY, etaText, &InterBlackMed, COL_TEXT, COL_BG);

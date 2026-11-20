@@ -1,20 +1,6 @@
 #include "state.h"
 #include "display.h"
 
-// Inverse of the settings page's hex-to-RGB565 conversion, for colors
-// picked via the custom color-wheel input and stored as "custom:#RRGGBB".
-uint16_t colorFromHex565(const String& hex) {
-  int start = hex.startsWith("#") ? 1 : 0;
-  if (hex.length() < start + 6) return 0x5EFA;
-  long r = strtol(hex.substring(start, start + 2).c_str(), nullptr, 16);
-  long g = strtol(hex.substring(start + 2, start + 4).c_str(), nullptr, 16);
-  long b = strtol(hex.substring(start + 4, start + 6).c_str(), nullptr, 16);
-  uint16_t r5 = (r * 31) / 255;
-  uint16_t g6 = (g * 63) / 255;
-  uint16_t b5 = (b * 31) / 255;
-  return (r5 << 11) | (g6 << 5) | b5;
-}
-
 // MakerPulse V.8
 // Nav: Home / Weather / Notes / Status
 // Full version
@@ -103,7 +89,7 @@ uint16_t COL_DIM       = 0x94B2;
 uint16_t COL_ACCENT    = 0x5EFA;
 
 
-String textColorKey = "standard";
+String shellColourKey = "muted-white";
 
 // Screen orientation. "bottom" uses rotationValue 0, the exact 180-degree
 // opposite of "top"'s rotationValue 2 on this ST7789 panel. Both TFT_eSPI
@@ -679,95 +665,81 @@ void updateTimerDoneDialogState() {
 
 
 // =========================================================
-// THEME / SETTINGS
+// SHELL COLOUR (see CONTEXT.md's "Shell colour" entry)
 // =========================================================
-void applyThemeByKey(const String& accentKey, const String& bgKey) {
-  if (accentKey.startsWith("custom:")) COL_ACCENT = colorFromHex565(accentKey.substring(7));
-  else if (accentKey == "standard")    COL_ACCENT = 0xEF7D;
-  else if (accentKey == "cyan")   COL_ACCENT = 0x5EFA;
-  else if (accentKey == "ice")    COL_ACCENT = 0xEFFF;
-  else if (accentKey == "white")  COL_ACCENT = TFT_WHITE;
-  else if (accentKey == "mint")   COL_ACCENT = 0x07F0;
-  else if (accentKey == "green")  COL_ACCENT = TFT_GREEN;
-  else if (accentKey == "blue")   COL_ACCENT = 0x3D9F;
-  else if (accentKey == "purple") COL_ACCENT = 0xA2F5;
-  else if (accentKey == "pink")   COL_ACCENT = 0xF97F;
-  else if (accentKey == "orange") COL_ACCENT = 0xFD20;
-  else if (accentKey == "amber")  COL_ACCENT = 0xFEA0;
-  else if (accentKey == "red")    COL_ACCENT = TFT_RED;
-  else if (accentKey == "olive")  COL_ACCENT = 0x5B48;
-  else                            COL_ACCENT = 0x5EFA;
+// The 8 fixed preset colours, one per physical 3D-printed case -- see
+// "MakerPulse Colours.pdf" and docs/adr/0002-fixed-shell-colour-palette.md
+// for where these came from and how BG/PANEL/STROKE/ACCENT were derived
+// from each case's sampled body color (same hue family, pale tint for the
+// screen background, WCAG AA-verified against the shared ink/dim). Text
+// (ink) and dim are intentionally hue-NEUTRAL constants shared by all 8 --
+// not derived per shell -- so every preset gets the same contrast margin
+// instead of needing 8 separate manual checks.
+struct ShellColourPalette {
+  const char* key;
+  const char* label;
+  uint16_t swatch; // raw case color, shown as the settings-page swatch
+  uint16_t bg, panel, stroke, accent;
+};
 
-  if (bgKey == "slate") {
-    COL_BG = 0x08A3; COL_PANEL = 0x1106; COL_PANEL_ALT = 0x18C7; COL_STROKE = 0x31EC;
-  } else if (bgKey == "deep") {
-    COL_BG = 0x0000; COL_PANEL = 0x0841; COL_PANEL_ALT = 0x1082; COL_STROKE = 0x2945;
-  } else if (bgKey == "nordic") {
-    COL_BG = 0x0864; COL_PANEL = 0x10C6; COL_PANEL_ALT = 0x1908; COL_STROKE = 0x3A2D;
-  } else if (bgKey == "forest") {
-    COL_BG = 0x0208; COL_PANEL = 0x0ACB; COL_PANEL_ALT = 0x134D; COL_STROKE = 0x2D72;
-  } else if (bgKey == "coffee") {
-    COL_BG = 0x18A3; COL_PANEL = 0x2945; COL_PANEL_ALT = 0x39C7; COL_STROKE = 0x5A89;
-  } else if (bgKey == "soft") {
-    COL_BG = 0x10A2; COL_PANEL = 0x1924; COL_PANEL_ALT = 0x2145; COL_STROKE = 0x3A49;
-  } else if (bgKey == "midnight") {
-    COL_BG = 0x0008; COL_PANEL = 0x0011; COL_PANEL_ALT = 0x0018; COL_STROKE = 0x3A7F;
-  } else if (bgKey == "graphite") {
-    COL_BG = 0x1082; COL_PANEL = 0x18C3; COL_PANEL_ALT = 0x2104; COL_STROKE = 0x4208;
-  } else if (bgKey == "garnet") {
-    COL_BG = 0x1004; COL_PANEL = 0x1886; COL_PANEL_ALT = 0x20E8; COL_STROKE = 0x41AC;
-  } else if (bgKey == "ochre") {
-    COL_BG = 0x20E1; COL_PANEL = 0x3184; COL_PANEL_ALT = 0x4226; COL_STROKE = 0x632B;
-  } else if (bgKey == "sage") {
-    // "Colourway theme" default -- light, case-complementary (sampled from
-    // the Sage-case mockup). Home draws fully flat (no cards) and ignores
-    // PANEL/PANEL_ALT/STROKE; these still apply to Weather/Bus/Status,
-    // which keep the bordered-card look until they're redesigned too.
-    COL_BG = 0xDF3A; COL_PANEL = 0xEF9C; COL_PANEL_ALT = 0xD6F9; COL_STROKE = 0xBE35;
-  } else {
-    COL_BG = 0x08A3; COL_PANEL = 0x1106; COL_PANEL_ALT = 0x18C7; COL_STROKE = 0x31EC;
+static const ShellColourPalette SHELL_COLOURS[] = {
+  { "muted-white",      "Muted White",      0xD679, 0xEF5D, 0xDEDB, 0xBDB6, 0x7224 },
+  { "pastel-ice",       "Pastel Ice",       0x9DD7, 0xEF7D, 0xD6FC, 0xADF8, 0x234E },
+  { "muted-blue",       "Muted Blue",       0x6C54, 0xEF5D, 0xD6DC, 0xADB8, 0x224E },
+  { "army-blue",        "Army Blue",        0x324D, 0xE75D, 0xD6DC, 0xA5B9, 0x222E },
+  { "muted-green",      "Muted Green",      0x5B2B, 0xEF5D, 0xDEFB, 0xB5D6, 0x43A4 },
+  { "army-red",         "Army Red",         0x8903, 0xEF3C, 0xE69A, 0xCD34, 0x78E3 },
+  { "pastel-peach",     "Pastel Peach",     0xF674, 0xEF5C, 0xE6DA, 0xCDD4, 0x8A61 },
+  { "mandarin-orange",  "Mandarin Orange",  0xE3C7, 0xEF5C, 0xE6DA, 0xCD94, 0x81E2 },
+};
+static const int SHELL_COLOUR_COUNT = sizeof(SHELL_COLOURS) / sizeof(SHELL_COLOURS[0]);
+
+// Hue-neutral constant ink/dim, shared by every shell colour.
+static const uint16_t SHELL_INK = 0x18C2;
+static const uint16_t SHELL_DIM = 0x5ACA;
+
+
+bool isValidShellColourKey(const String& key) {
+  for (int i = 0; i < SHELL_COLOUR_COUNT; i++) {
+    if (key == SHELL_COLOURS[i].key) return true;
   }
+  return false;
 }
 
 
-void applyTextColorByKey(const String& key) {
-  textColorKey = key;
-
-  if (key.startsWith("custom:")) {
-    COL_TEXT = colorFromHex565(key.substring(7));
-    COL_DIM  = COL_TEXT;
-  } else if (key == "standard") {
-    COL_TEXT = 0xEF7D; COL_DIM  = 0x94B2;
-  } else if (key == "white") {
-    COL_TEXT = TFT_WHITE; COL_DIM = 0xBDF7;
-  } else if (key == "ice") {
-    COL_TEXT = 0xEFFF; COL_DIM = 0x9D7F;
-  } else if (key == "mint") {
-    COL_TEXT = 0x07F0; COL_DIM = 0x05EC;
-  } else if (key == "orange") {
-    COL_TEXT = 0xFD20; COL_DIM = 0xBA26;
-  } else if (key == "amber") {
-    COL_TEXT = 0xFEA0; COL_DIM = 0xBCE0;
-  } else if (key == "green") {
-    COL_TEXT = TFT_GREEN; COL_DIM = 0x86E8;
-  } else if (key == "cyan") {
-    COL_TEXT = 0x5EFA; COL_DIM = 0x3D96;
-  } else if (key == "blue") {
-    COL_TEXT = 0x3D9F; COL_DIM = 0x22B1;
-  } else if (key == "purple") {
-    COL_TEXT = 0xA2F5; COL_DIM = 0x79ED;
-  } else if (key == "red") {
-    COL_TEXT = TFT_RED; COL_DIM = 0xB9E7;
-  } else if (key == "pink") {
-    COL_TEXT = 0xF97F; COL_DIM = 0xC2F1;
-  } else if (key == "ink") {
-    // "Colourway theme" default -- dark ink on the sage/cream background.
-    COL_TEXT = 0x1102; COL_DIM = 0x9511;
-  } else {
-    COL_TEXT = 0xEF7D;
-    COL_DIM  = 0x94B2;
-    textColorKey = "standard";
+const char* shellColourLabel(const String& key) {
+  for (int i = 0; i < SHELL_COLOUR_COUNT; i++) {
+    if (key == SHELL_COLOURS[i].key) return SHELL_COLOURS[i].label;
   }
+  return SHELL_COLOURS[0].label;
+}
+
+
+int shellColourCount() { return SHELL_COLOUR_COUNT; }
+
+
+// For the settings page's swatch row -- iterate idx 0..shellColourCount()-1.
+void shellColourAt(int idx, const char** key, const char** label, uint16_t* swatch) {
+  if (idx < 0 || idx >= SHELL_COLOUR_COUNT) idx = 0;
+  *key = SHELL_COLOURS[idx].key;
+  *label = SHELL_COLOURS[idx].label;
+  *swatch = SHELL_COLOURS[idx].swatch;
+}
+
+
+void applyShellColourByKey(const String& key) {
+  const ShellColourPalette* p = &SHELL_COLOURS[0];
+  for (int i = 0; i < SHELL_COLOUR_COUNT; i++) {
+    if (key == SHELL_COLOURS[i].key) { p = &SHELL_COLOURS[i]; break; }
+  }
+  shellColourKey = p->key;
+  COL_BG = p->bg;
+  COL_PANEL = p->panel;
+  COL_PANEL_ALT = p->panel;
+  COL_STROKE = p->stroke;
+  COL_ACCENT = p->accent;
+  COL_TEXT = SHELL_INK;
+  COL_DIM = SHELL_DIM;
 }
 
 
@@ -803,12 +775,11 @@ void loadStoredSettings() {
   storedWifiPass    = prefs.getString("wifiPass", "");
   deviceProvisioned = storedWifiSsid.length() > 0;
 
-  // Defaults to the "Colourway theme" look (see CONTEXT.md) rather than
-  // MakerPulse's dark defaults -- still fully overridable via the same
-  // settings-page color pickers.
-  String accent = prefs.getString("accent", "olive");
-  String bg     = prefs.getString("bg", "sage");
-  String txt    = prefs.getString("text", "ink");
+  // One of the 8 fixed shell colours -- see CONTEXT.md's "Shell colour"
+  // entry. No custom picker in V2; an invalid/missing key falls back to
+  // the first preset.
+  String shellColour = prefs.getString("shellColour", "muted-white");
+  if (!isValidShellColourKey(shellColour)) shellColour = "muted-white";
 
   deviceNickname    = prefs.getString("nickname", "");
   locationName     = prefs.getString("locname", "Singapore");
@@ -856,8 +827,7 @@ void loadStoredSettings() {
   if (unitKey != "metric" && unitKey != "imperial") unitKey = "metric";
   if (regionFormatKey != "europe" && regionFormatKey != "us") regionFormatKey = "europe";
   deviceNickname.trim();
-  applyThemeByKey(accent, bg);
-  applyTextColorByKey(txt);
+  applyShellColourByKey(shellColour);
   applyDeviceTimezoneByKey(timezoneKey);
 }
 

@@ -91,38 +91,16 @@ static String cssColorFrom565(uint16_t color) {
 }
 
 
-static String accentPreviewCss(const String& key) {
-  if (key == "standard") return cssColorFrom565(0xEF7D);
-  if (key == "ice")      return cssColorFrom565(0xEFFF);
-  if (key == "white")    return cssColorFrom565(TFT_WHITE);
-  if (key == "cyan")     return cssColorFrom565(0x5EFA);
-  if (key == "mint")     return cssColorFrom565(0x07F0);
-  if (key == "green")    return cssColorFrom565(TFT_GREEN);
-  if (key == "blue")     return cssColorFrom565(0x3D9F);
-  if (key == "purple")   return cssColorFrom565(0xA2F5);
-  if (key == "pink")     return cssColorFrom565(0xF97F);
-  if (key == "orange")   return cssColorFrom565(0xFD20);
-  if (key == "amber")    return cssColorFrom565(0xFEA0);
-  if (key == "red")      return cssColorFrom565(TFT_RED);
-  if (key == "olive")    return cssColorFrom565(0x5B48);
-  if (key == "ink")      return cssColorFrom565(0x1102);
-  return cssColorFrom565(0xEF7D);
-}
-
-
-static String themePreviewCss(const String& key) {
-  if (key == "slate")    return cssColorFrom565(0x08A3);
-  if (key == "deep")     return cssColorFrom565(0x0000);
-  if (key == "nordic")   return cssColorFrom565(0x0864);
-  if (key == "forest")   return cssColorFrom565(0x0208);
-  if (key == "coffee")   return cssColorFrom565(0x18A3);
-  if (key == "soft")     return cssColorFrom565(0x10A2);
-  if (key == "midnight") return cssColorFrom565(0x0008);
-  if (key == "graphite") return cssColorFrom565(0x1082);
-  if (key == "garnet")   return cssColorFrom565(0x1004);
-  if (key == "ochre")    return cssColorFrom565(0x20E1);
-  if (key == "sage")     return cssColorFrom565(0xDF3A);
-  return cssColorFrom565(0x08A3);
+// Swatch color shown on the settings page is the raw case color (what the
+// physical shell actually looks like), not the derived screen background.
+static String shellColourPreviewCss(const String& key) {
+  const char* k; const char* label; uint16_t swatch;
+  for (int i = 0; i < shellColourCount(); i++) {
+    shellColourAt(i, &k, &label, &swatch);
+    if (key == k) return cssColorFrom565(swatch);
+  }
+  shellColourAt(0, &k, &label, &swatch);
+  return cssColorFrom565(swatch);
 }
 
 
@@ -130,13 +108,8 @@ static String themePreviewCss(const String& key) {
 // WEB SERVER
 // =========================================================
 void handleRoot() {
-  String accent = prefs.getString("accent", "olive");
-  String bg     = prefs.getString("bg", "sage");
-  String txt    = prefs.getString("text", "ink");
-  // Each color key is either a named preset or "custom:#RRGGBB" from the
-  // color-wheel input; resolve either form to the hex the page should show.
-  String accentHex = accent.startsWith("custom:") ? accent.substring(7) : accentPreviewCss(accent);
-  String textHex   = txt.startsWith("custom:")    ? txt.substring(7)    : accentPreviewCss(txt);
+  String shellColour = prefs.getString("shellColour", "muted-white");
+  if (!isValidShellColourKey(shellColour)) shellColour = "muted-white";
   String units  = prefs.getString("units", "metric");
   String region = prefs.getString("region", "europe");
   String tz     = sanitizeTimezoneKey(prefs.getString("tz", "singapore"));
@@ -201,9 +174,6 @@ void handleRoot() {
   page += ".swatch-row{display:flex;flex-wrap:wrap;gap:8px;}";
   page += ".swatch{width:22px;height:22px;border-radius:999px;border:1px solid rgba(0,0,0,.15);cursor:pointer;position:relative;box-sizing:border-box;}";
   page += ".swatch input{display:none;}";
-  page += ".color-wheel{-webkit-appearance:none;appearance:none;width:22px;height:22px;padding:0;border:1px solid rgba(0,0,0,.15);border-radius:999px;cursor:pointer;background:none;}";
-  page += ".color-wheel::-webkit-color-swatch-wrapper{padding:0;}";
-  page += ".color-wheel::-webkit-color-swatch{border:none;border-radius:999px;}";
   page += ".swatch.active{box-shadow:0 0 0 2px #61ce70, 0 0 0 5px rgba(97,206,112,.18);}";
   page += ".swatch.active::after{content:'';position:absolute;inset:5px;border-radius:999px;border:1px solid rgba(0,16,24,.45);}";
   page += ".timer-slot-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:14px;}";
@@ -228,68 +198,22 @@ void handleRoot() {
   page += "<div class='layout'><div class='stack'>";
 
   page += "<div class='panel' data-panel='theme'>";
-  page += "<button type='button' class='panel-toggle' aria-expanded='true'><h2>Theme and color</h2><span class='panel-chevron'>&#9662;</span></button>";
+  page += "<button type='button' class='panel-toggle' aria-expanded='true'><h2>Shell colour</h2><span class='panel-chevron'>&#9662;</span></button>";
   page += "<div class='panel-body'>";
-  page += "<p>Colors and visual style for the display.</p>";
+  page += "<p>Pick the preset that matches your MakerPulseV2's physical case. The screen's colors are fixed to this choice -- there's no separate accent, text, or custom color picker.</p>";
   page += "<div class='grid'>";
 
   page += "<div style='grid-column:1 / -1;' class='color-stack'>";
-
-  page += "<div class='color-row'><div class='color-meta'><label class='label'>Accent</label><span class='color-value' id='accent-value'>";
-  page += accent;
+  page += "<div class='color-row'><div class='color-meta'><label class='label'>Shell colour</label><span class='color-value' id='shellColour-value'>";
+  page += shellColourLabel(shellColour);
   page += "</span></div><div class='swatch-row'>";
-  page += "<label class='swatch" + String(accent=="standard"?" active":"") + "' style='background:" + accentPreviewCss("standard") + ";'><input type='radio' name='accent' value='standard'" + String(accent=="standard"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(accent=="ice"?" active":"") + "' style='background:" + accentPreviewCss("ice") + ";'><input type='radio' name='accent' value='ice'" + String(accent=="ice"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(accent=="white"?" active":"") + "' style='background:" + accentPreviewCss("white") + ";'><input type='radio' name='accent' value='white'" + String(accent=="white"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(accent=="cyan"?" active":"") + "' style='background:" + accentPreviewCss("cyan") + ";'><input type='radio' name='accent' value='cyan'" + String(accent=="cyan"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(accent=="mint"?" active":"") + "' style='background:" + accentPreviewCss("mint") + ";'><input type='radio' name='accent' value='mint'" + String(accent=="mint"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(accent=="green"?" active":"") + "' style='background:" + accentPreviewCss("green") + ";'><input type='radio' name='accent' value='green'" + String(accent=="green"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(accent=="blue"?" active":"") + "' style='background:" + accentPreviewCss("blue") + ";'><input type='radio' name='accent' value='blue'" + String(accent=="blue"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(accent=="purple"?" active":"") + "' style='background:" + accentPreviewCss("purple") + ";'><input type='radio' name='accent' value='purple'" + String(accent=="purple"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(accent=="pink"?" active":"") + "' style='background:" + accentPreviewCss("pink") + ";'><input type='radio' name='accent' value='pink'" + String(accent=="pink"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(accent=="orange"?" active":"") + "' style='background:" + accentPreviewCss("orange") + ";'><input type='radio' name='accent' value='orange'" + String(accent=="orange"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(accent=="amber"?" active":"") + "' style='background:" + accentPreviewCss("amber") + ";'><input type='radio' name='accent' value='amber'" + String(accent=="amber"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(accent=="red"?" active":"") + "' style='background:" + accentPreviewCss("red") + ";'><input type='radio' name='accent' value='red'" + String(accent=="red"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(accent.startsWith("custom:")?" active":"") + "' id='accent-custom-swatch' style='background:" + accentHex + ";'><input type='radio' name='accent' value='custom'" + String(accent.startsWith("custom:")?" checked":"") + "></label>";
-  page += "<input type='color' class='color-wheel' value='" + accentHex + "' oninput=\"document.getElementById('accent-custom-swatch').style.background=this.value;document.getElementById('accent-custom-swatch').querySelector('input').checked=true;document.getElementById('accent-custom-swatch').querySelector('input').dispatchEvent(new Event('change'));document.getElementById('accent-custom-hex').value=this.value;\">";
-  page += "<input type='hidden' name='accentCustom' id='accent-custom-hex' value='" + accentHex + "'>";
+  for (int i = 0; i < shellColourCount(); i++) {
+    const char* key; const char* label; uint16_t swatch565;
+    shellColourAt(i, &key, &label, &swatch565);
+    bool active = (shellColour == key);
+    page += "<label class='swatch" + String(active ? " active" : "") + "' data-label='" + label + "' style='background:" + cssColorFrom565(swatch565) + ";'><input type='radio' name='shellColour' value='" + key + "'" + String(active ? " checked" : "") + "></label>";
+  }
   page += "</div></div>";
-
-  page += "<div class='color-row'><div class='color-meta'><label class='label'>Text</label><span class='color-value' id='text-value'>";
-  page += txt;
-  page += "</span></div><div class='swatch-row'>";
-  page += "<label class='swatch" + String(txt=="standard"?" active":"") + "' style='background:" + accentPreviewCss("standard") + ";'><input type='radio' name='text' value='standard'" + String(txt=="standard"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(txt=="ice"?" active":"") + "' style='background:" + accentPreviewCss("ice") + ";'><input type='radio' name='text' value='ice'" + String(txt=="ice"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(txt=="white"?" active":"") + "' style='background:" + accentPreviewCss("white") + ";'><input type='radio' name='text' value='white'" + String(txt=="white"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(txt=="cyan"?" active":"") + "' style='background:" + accentPreviewCss("cyan") + ";'><input type='radio' name='text' value='cyan'" + String(txt=="cyan"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(txt=="mint"?" active":"") + "' style='background:" + accentPreviewCss("mint") + ";'><input type='radio' name='text' value='mint'" + String(txt=="mint"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(txt=="green"?" active":"") + "' style='background:" + accentPreviewCss("green") + ";'><input type='radio' name='text' value='green'" + String(txt=="green"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(txt=="blue"?" active":"") + "' style='background:" + accentPreviewCss("blue") + ";'><input type='radio' name='text' value='blue'" + String(txt=="blue"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(txt=="purple"?" active":"") + "' style='background:" + accentPreviewCss("purple") + ";'><input type='radio' name='text' value='purple'" + String(txt=="purple"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(txt=="pink"?" active":"") + "' style='background:" + accentPreviewCss("pink") + ";'><input type='radio' name='text' value='pink'" + String(txt=="pink"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(txt=="orange"?" active":"") + "' style='background:" + accentPreviewCss("orange") + ";'><input type='radio' name='text' value='orange'" + String(txt=="orange"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(txt=="amber"?" active":"") + "' style='background:" + accentPreviewCss("amber") + ";'><input type='radio' name='text' value='amber'" + String(txt=="amber"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(txt=="red"?" active":"") + "' style='background:" + accentPreviewCss("red") + ";'><input type='radio' name='text' value='red'" + String(txt=="red"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(txt.startsWith("custom:")?" active":"") + "' id='text-custom-swatch' style='background:" + textHex + ";'><input type='radio' name='text' value='custom'" + String(txt.startsWith("custom:")?" checked":"") + "></label>";
-  page += "<input type='color' class='color-wheel' value='" + textHex + "' oninput=\"document.getElementById('text-custom-swatch').style.background=this.value;document.getElementById('text-custom-swatch').querySelector('input').checked=true;document.getElementById('text-custom-swatch').querySelector('input').dispatchEvent(new Event('change'));document.getElementById('text-custom-hex').value=this.value;\">";
-  page += "<input type='hidden' name='textCustom' id='text-custom-hex' value='" + textHex + "'>";
-  page += "</div></div>";
-
-  page += "<div class='color-row'><div class='color-meta'><label class='label'>Theme</label><span class='color-value' id='bg-value'>";
-  page += bg;
-  page += "</span></div><div class='swatch-row'>";
-  page += "<label class='swatch" + String(bg=="slate"?" active":"") + "' style='background:" + themePreviewCss("slate") + ";'><input type='radio' name='bg' value='slate'" + String(bg=="slate"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(bg=="deep"?" active":"") + "' style='background:" + themePreviewCss("deep") + ";'><input type='radio' name='bg' value='deep'" + String(bg=="deep"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(bg=="nordic"?" active":"") + "' style='background:" + themePreviewCss("nordic") + ";'><input type='radio' name='bg' value='nordic'" + String(bg=="nordic"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(bg=="forest"?" active":"") + "' style='background:" + themePreviewCss("forest") + ";'><input type='radio' name='bg' value='forest'" + String(bg=="forest"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(bg=="coffee"?" active":"") + "' style='background:" + themePreviewCss("coffee") + ";'><input type='radio' name='bg' value='coffee'" + String(bg=="coffee"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(bg=="soft"?" active":"") + "' style='background:" + themePreviewCss("soft") + ";'><input type='radio' name='bg' value='soft'" + String(bg=="soft"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(bg=="midnight"?" active":"") + "' style='background:" + themePreviewCss("midnight") + ";'><input type='radio' name='bg' value='midnight'" + String(bg=="midnight"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(bg=="graphite"?" active":"") + "' style='background:" + themePreviewCss("graphite") + ";'><input type='radio' name='bg' value='graphite'" + String(bg=="graphite"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(bg=="garnet"?" active":"") + "' style='background:" + themePreviewCss("garnet") + ";'><input type='radio' name='bg' value='garnet'" + String(bg=="garnet"?" checked":"") + "></label>";
-  page += "<label class='swatch" + String(bg=="ochre"?" active":"") + "' style='background:" + themePreviewCss("ochre") + ";'><input type='radio' name='bg' value='ochre'" + String(bg=="ochre"?" checked":"") + "></label>";
-  page += "</div></div>";
-
   page += "</div>";
 
   page += "</div></div></div>";
@@ -386,7 +310,6 @@ void handleRoot() {
   page += "<div class='ym-footer'>Built by <a href='https://theyoungmaker.com' target='_blank' rel='noopener'>The Young Maker</a> &middot; <a href='https://theyoungmaker.com/3dlab/' target='_blank' rel='noopener'>3D Lab</a></div>";
   page += "<div class='ym-footer'>MakerPulse firmware v" FIRMWARE_VERSION "</div>";
   page += "<script>";
-  page += "var colorNames={accent:{standard:'Standard',ice:'Ice',white:'White',cyan:'Cyan',mint:'Mint',green:'Green',blue:'Blue',purple:'Purple',pink:'Pink',orange:'Orange',amber:'Amber',red:'Red'},text:{standard:'Standard',ice:'Ice',white:'White',cyan:'Cyan',mint:'Mint',green:'Green',blue:'Blue',purple:'Purple',pink:'Pink',orange:'Orange',amber:'Amber',red:'Red'},bg:{slate:'Slate',deep:'Deep black',nordic:'Nordic blue',forest:'Forest',coffee:'Coffee',soft:'Soft dark',midnight:'Midnight',graphite:'Graphite',garnet:'Garnet',ochre:'Ochre'}};";
   page += "var panelStorageKey='makerpulse-panel-state-v1';";
   page += "document.querySelectorAll('.swatch input').forEach(function(input){";
   page += "input.addEventListener('change',function(){";
@@ -394,8 +317,8 @@ void handleRoot() {
   page += "peer.closest('.swatch').classList.toggle('active', peer.checked);";
   page += "});";
   page += "var valueEl=document.getElementById(input.name+'-value');";
-  page += "if(valueEl&&input.value==='custom'){var hexEl=document.getElementById(input.name+'-custom-hex');valueEl.textContent=hexEl?hexEl.value:'Custom';}";
-  page += "else if(valueEl&&colorNames[input.name]&&colorNames[input.name][input.value]){valueEl.textContent=colorNames[input.name][input.value];}";
+  page += "var label=input.closest('.swatch').getAttribute('data-label');";
+  page += "if(valueEl&&label){valueEl.textContent=label;}";
   page += "});";
   page += "});";
   page += "function readPanelState(){try{return JSON.parse(localStorage.getItem(panelStorageKey)||'{}');}catch(e){return {};}}";
@@ -424,19 +347,8 @@ void handleRoot() {
 
 
 void handleSave() {
-  String newAccent = server.hasArg("accent") ? server.arg("accent") : "olive";
-  String newBg     = server.hasArg("bg") ? server.arg("bg") : "sage";
-  String newText   = server.hasArg("text") ? server.arg("text") : "ink";
-  // The color-wheel swatch posts accent/text="custom" plus the picked hex
-  // in a sibling field; fold that into the stored key as "custom:#RRGGBB".
-  if (newAccent == "custom") {
-    String hex = server.hasArg("accentCustom") ? server.arg("accentCustom") : "#5EFA5E";
-    newAccent = "custom:" + hex;
-  }
-  if (newText == "custom") {
-    String hex = server.hasArg("textCustom") ? server.arg("textCustom") : "#EFEF7D";
-    newText = "custom:" + hex;
-  }
+  String newShellColour = server.hasArg("shellColour") ? server.arg("shellColour") : shellColourKey;
+  if (!isValidShellColourKey(newShellColour)) newShellColour = shellColourKey;
   String newUnits  = server.hasArg("units") ? server.arg("units") : "metric";
   String newRegion = server.hasArg("region") ? server.arg("region") : "europe";
   String newTz     = server.hasArg("tz") ? server.arg("tz") : timezoneKey;
@@ -540,9 +452,7 @@ void handleSave() {
     timerPresetMin[i] = sanitizeTimerMinutes(nextValue);
   }
 
-  prefs.putString("accent", newAccent);
-  prefs.putString("bg", newBg);
-  prefs.putString("text", newText);
+  prefs.putString("shellColour", newShellColour);
   prefs.putString("units", unitKey);
   prefs.putString("region", regionFormatKey);
   prefs.putString("tz", timezoneKey);
@@ -573,8 +483,7 @@ void handleSave() {
     prefs.putInt(key.c_str(), timerPresetMin[i]);
   }
 
-  applyThemeByKey(newAccent, newBg);
-  applyTextColorByKey(newText);
+  applyShellColourByKey(newShellColour);
   applyDeviceTimezoneByKey(timezoneKey);
   applyOrientationByKey(newOrientation); // hot-applies rotation/touch, no reboot needed
   if (!sleepDimmed && !sleepOff) setBacklight(BL_FULL);

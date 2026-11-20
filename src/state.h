@@ -35,7 +35,10 @@ extern String locationName;
 extern uint16_t COL_BG, COL_PANEL, COL_PANEL_ALT, COL_STROKE, COL_TEXT, COL_DIM, COL_ACCENT;
 extern const uint16_t COL_GREEN, COL_YELLOW, COL_RED, COL_BLUE;
 
-extern String textColorKey;
+// One of the 8 fixed shell colours -- see CONTEXT.md's "Shell colour"
+// entry. Replaces MakerPulse's freeform Accent/Text/Theme system; there is
+// no custom picker in V2.
+extern String shellColourKey;
 extern String unitKey;
 extern String regionFormatKey;
 extern String timezoneKey;
@@ -145,10 +148,12 @@ void openTimerDoneDialog();
 void updateFocusTimerState();
 void updateTimerDoneDialogState();
 
-void applyThemeByKey(const String& accentKey, const String& bgKey);
-void applyTextColorByKey(const String& key);
+void applyShellColourByKey(const String& key);
+const char* shellColourLabel(const String& key);
+bool isValidShellColourKey(const String& key);
+int shellColourCount();
+void shellColourAt(int idx, const char** key, const char** label, uint16_t* swatch);
 void applyOrientationByKey(const String& key);
-uint16_t colorFromHex565(const String& hex);
 
 void loadStoredSettings();
 void resetDataCaches();
