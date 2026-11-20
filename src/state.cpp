@@ -670,18 +670,27 @@ void updateTimerDoneDialogState() {
 // The 8 fixed preset colours, one per physical 3D-printed case -- see
 // "MakerPulse Colours.pdf" and docs/adr/0002-fixed-shell-colour-palette.md
 // for where these came from and how BG/PANEL/STROKE/ACCENT were derived
-// from each case's sampled body color (same hue family, pale tint for the
-// screen background, explicitly checked for (a) WCAG AA against the shared
-// ink/dim and (b) pairwise RGB565 distinctness -- the first version of
-// this table passed (a) but not (b): several presets' tints rounded to the
-// *same* 16-bit pixel value once quantized, so switching shells visibly
-// changed nothing. Two shells (Muted White, Muted Green) have such low
-// source saturation that preserving their "hue" produced an unstable,
-// near-arbitrary tint that collided with unrelated shells; those two are
-// derived as neutral (zero-saturation) tints instead. Text (ink) and dim
-// are intentionally hue-NEUTRAL constants shared by all 8 -- not derived
-// per shell -- so every preset gets the same contrast margin instead of
-// needing 8 separate manual checks.
+// from each case's sampled body color (same hue family, same formula).
+// Gone through two corrections already, both found by actually computing
+// numbers rather than eyeballing hex codes:
+//   1. The first version's tints were pale enough that several rounded to
+//      the *same* 16-bit RGB565 pixel value once quantized -- switching
+//      shells visibly changed nothing. Two shells (Muted White, Muted
+//      Green) have such low source saturation that preserving their "hue"
+//      produced an unstable, near-arbitrary tint that collided with
+//      unrelated shells; those two are derived as neutral
+//      (zero-saturation) tints instead.
+//   2. That fix left every preset still reading as "barely tinted
+//      off-white" -- each one's own color wasn't obvious. Darkened and
+//      re-saturated via a grid search over (background lightness,
+//      saturation cap, dim-text grey) for the darkest/most-saturated
+//      combination that still clears WCAG AA with a real margin (>=5:1,
+//      not just the 4.5:1 minimum) on every pairing actually drawn on
+//      screen: ink/dim vs background, ink vs panel, and
+//      background-colored text vs accent (the timer-alarm flash).
+// Text (ink) and dim are intentionally hue-NEUTRAL constants shared by
+// all 8 -- not derived per shell -- so every preset gets the same
+// contrast margin instead of needing 8 separate manual checks.
 struct ShellColourPalette {
   const char* key;
   const char* label;
@@ -690,20 +699,25 @@ struct ShellColourPalette {
 };
 
 static const ShellColourPalette SHELL_COLOURS[] = {
-  { "muted-white",      "Muted White",      0xD679, 0xE71C, 0xCE59, 0xA514, 0x51C5 },
-  { "pastel-ice",       "Pastel Ice",       0x9DD7, 0xD71C, 0xBE7A, 0x7D97, 0x1AAC },
-  { "muted-blue",       "Muted Blue",       0x6C54, 0xD6DC, 0xB61A, 0x74B7, 0x19CC },
-  { "army-blue",        "Army Blue",        0x324D, 0xC67C, 0xA5BA, 0x6436, 0x19AC },
-  { "muted-green",      "Muted Green",      0x5B2B, 0xD69A, 0xBDF7, 0x9492, 0x3A85 },
-  { "army-red",         "Army Red",         0x8903, 0xE617, 0xDCF3, 0xCAAA, 0x60C2 },
-  { "pastel-peach",     "Pastel Peach",     0xF674, 0xEF1A, 0xE656, 0xD50D, 0x69E1 },
-  { "mandarin-orange",  "Mandarin Orange",  0xE3C7, 0xEEB9, 0xDDF4, 0xD44B, 0x6982 },
+  { "muted-white",      "Muted White",      0xD679, 0xC618, 0xAD75, 0x8430, 0x49A4 },
+  { "pastel-ice",       "Pastel Ice",       0x9DD7, 0xB659, 0x9DB7, 0x6493, 0x128B },
+  { "muted-blue",       "Muted Blue",       0x6C54, 0xADD9, 0x9537, 0x5BD3, 0x11AB },
+  { "army-blue",        "Army Blue",        0x324D, 0x9D79, 0x7CB7, 0x4B73, 0x118B },
+  { "muted-green",      "Muted Green",      0x5B2B, 0xB5B6, 0xA514, 0x7BCF, 0x3244 },
+  { "army-red",         "Army Red",         0x8903, 0xCCF3, 0xBC0F, 0xA248, 0x58A2 },
+  { "pastel-peach",     "Pastel Peach",     0xF674, 0xD616, 0xCD72, 0xB42A, 0x61C1 },
+  { "mandarin-orange",  "Mandarin Orange",  0xE3C7, 0xCDB4, 0xC4F1, 0xB389, 0x6162 },
 };
 static const int SHELL_COLOUR_COUNT = sizeof(SHELL_COLOURS) / sizeof(SHELL_COLOURS[0]);
 
-// Hue-neutral constant ink/dim, shared by every shell colour.
+// Hue-neutral constant ink/dim, shared by every shell colour. Darkened
+// along with the backgrounds below (see docs/adr/0002) -- re-verified at
+// >=5:1 contrast (a safety buffer above the 4.5:1 AA minimum, since this
+// is right where backgrounds got meaningfully more saturated/darker) on
+// every pairing actually used on screen: ink/dim vs background, ink vs
+// panel, and background-colored text vs accent (the timer-alarm flash).
 static const uint16_t SHELL_INK = 0x10A2;
-static const uint16_t SHELL_DIM = 0x4A69;
+static const uint16_t SHELL_DIM = 0x31A6;
 
 
 bool isValidShellColourKey(const String& key) {
