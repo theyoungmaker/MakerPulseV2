@@ -5,7 +5,9 @@
 This is a from-the-spec rewrite of the entire on-device UI, triggered by a
 complete pixel-exact design spec (`docs/MAKERPULSE_V2_SPEC.md`) and ten
 reference mockups (`docs/screens/`) the user supplied. It was built in 8
-phases (below), each compiling clean before the next started.
+phases (below), each compiling clean before the next started, followed by
+two more rounds of user-driven changes after the first real hardware flash
+(Phase 9's font/layout bug fixes, Phase 10's timer picker rebuild).
 
 **What changed, by area:**
 
@@ -24,9 +26,13 @@ phases (below), each compiling clean before the next started.
 - **Home**: fixed four-tile layout (Bus/Outdoor/Rain/Timer) replaces the
   old fully-customizable widget-slot system; the focus timer gained an
   explicit idle/running/paused/done state machine (was running/finished
-  only, with no pause) and a fixed 5/10/15/25/45 min cycle (was six
-  user-editable presets with a popup menu); the done takeover now matches
-  the spec's accent-fill/flash/60s-auto-dismiss design exactly.
+  only, with no pause). Phase 4 initially replaced the old six-preset
+  popup menu with a fixed 5/10/15/25/45 min long-press-cycle, but Phase 10
+  reversed that back to a tap-opened picker with six *editable* presets
+  (1/3/5/10/15/30 min default) plus Custom entry, once the shared
+  long-press gesture turned out to be unreliable in practice (see Phase
+  10's log entry). The done takeover now matches the spec's
+  accent-fill/flash/60s-auto-dismiss design exactly.
 - **Weather**: gained a 6-hour rain-chance strip with a tap-to-toggle
   5-day view, a proper hero icon, and PSI/UV stat columns with the spec's
   exact band words — none of this existed before (the old Weather page was
@@ -259,3 +265,35 @@ not by hardware testing — see "Known limits" below for why that matters.
 **Verified**: both build variants compile cleanly with `FIRMWARE_VERSION "2.1.0"` after a full clean rebuild (only the pre-existing ArduinoJson deprecation warnings). Flash usage 37.1% (~1.167MB / 3,145,728 bytes), RAM 15.9%. Hardware verification is the one thing this phase could not do — see "Known limits" in the summary above.
 
 **Known limits carried forward**: all of them are listed in the "Summary: v1.2.0 → v2.1.0" section at the top of this log, headlined by the lack of any hardware verification since Phase 1. The device should be flashed and run through the on-device acceptance checklist (spec's own list) at the first opportunity.
+
+## Phase 9 — On-hardware font/layout fixes (2026-11-18)
+
+First real flash since Phase 1 surfaced three bugs invisible to the compile-only verification Phases 2-8 relied on, all from user-supplied screenshots of the four pages:
+
+- **All 7 fonts were ~40-50% oversized.** Phase 1's font generation calibrated pixel sizes against digit heights measured directly off `docs/screens/*.png`, which are rendered at 2x scale (documented in `docs/screens/README.md` and `CLAUDE.md`) — the halving step was missed. Regenerated all 7 at the spec's literal nominal sizes instead of back-solving from a measured target (e.g. `F_DISPLAY` 82px → 56px), verified against the spec's own "23:58 ends near x165" acceptance line.
+- **`drawSmallCapsLabel()` collapsed spaces in multi-word labels** ("BUS STOP" → "BUSSTOP"). Root cause: `TFT_eSPI::textWidth()` has a last-character special case (assumes a right-aligned string's trailing side-bearing shouldn't be over-counted) that's correct for whole-string calls but returns 0 for a space glyph when called per-character in a loop, since every call sees its one character as "the last." Fixed by reading `xAdvance` directly from the glyph table instead of calling `textWidth()` per character.
+- **Tab bar overlapped on "Weather"**: the fixed 54px-per-label cell pitch had no margin for it. Switched to dynamic per-label widths with an explicit gap, centred in the content column (same technique Status's `computeSegmentedLayout()` already used).
+
+Also rescaled the degree-ring/middot glyph substitutes in `drawTextWithDegree()` to `tft.fontHeight()` instead of a fixed `r=3`, which read as a disconnected speck above the large `F_DISPLAY`/`F_NUM` digits once those shrank back to their correct size.
+
+**Verified:** compiles clean; user confirmed the device was reflashed (via the GitHub Pages ESP Web Tools site after repeated direct-USB upload instability) and is running with a live WiFi connection. Fresh photos confirming the visual overlap is actually resolved are still outstanding.
+
+## Phase 10 — Timer picker rebuild, reversing two Phase-4 decisions (2026-11-21)
+
+User feedback: wanted the 6 preset durations back as **1/3/5/10/15/30 min** (was 5/10/15/25/45), a **Custom** entry option, and reported long-press "does not work" at all. A full grilling session (`userSettings:grill-with-docs`) settled the design — see CONTEXT.md's new "timer picker" entry for the resulting model. This reverses two Phase-4 decisions: the fixed long-press-cycle timer became a tap-opened picker, and "no settings-page editing" for the presets became editable again.
+
+**Changed:**
+- **Root-caused the long-press bug**, not timer-specific: `pollTouchEvent()` (`display.cpp`) tracked the *maximum* finger drift since a press began (`maxMoveSq`), with a 10px tolerance that never reset or decayed — one noisy sample anywhere during a 600ms hold permanently disqualified that whole press from ever firing `TOUCH_LONG_PRESS`, even if the finger never moved again. Fixed by checking the finger's *current* distance from the anchor at each poll instead (a resistive touchscreen's initial-contact noise settles well before 600ms), against a separate, looser `V2_LONGPRESS_MAX_MOVE_PX` (20px, `config.h`) — tap detection is untouched, since it has no "current position" to check at release time and still needs the accumulated `maxMoveSq`. `touchHoldMsInRect()` (the Status 5s calibration hold) picked up the same looser constant for consistency, since it's the same class of gesture. This one fix benefits the clock's 12h/24h long-press toggle and the Bus page's favourite-row long-press too, not just the timer.
+- **Home Timer tile tap is now state-aware** (`handleTimerTileTap()`, `state.cpp`, replacing `startOrToggleFocusTimer()`): Idle and Paused taps both open the timer picker; Running still just pauses. The old long-press actions (`cycleFocusDuration()`/`resetFocusTimerToIdle()`) are gone — picking a duration in the picker is itself "go," there's no separate start step.
+- **New timer picker overlay** (`drawTimerPickerOverlay()`/`handleTimerPickerTouch()`, `display.cpp`): full-screen, flat, hairline-separated rows — the 6 presets + Custom, with Resume/Stop prepended when reopened from Paused. **New Custom stepper** (`drawCustomTimerStepperOverlay()`/`handleCustomTimerStepperTouch()`): ±1/±5 buttons, 1-180 min range, pre-filled with `focusDurationMin` (whatever was last actually run, not a fixed default). Its explicit Cancel returns to the picker; tapping outside its panel band closes everything via `closeTimerPicker()` (leaves `focusTimerState` untouched, so an accidental outside-tap can't cancel a paused session as a side effect) — this replicates old MakerPulse's `handleCustomTimerEntryTouch()` Cancel-vs-tap-outside distinction. Both overlays are wired into `main.cpp`'s touch dispatch and `drawCurrentPageFull()`/`updateCurrentPageDynamic()` as top-level modals, the same pattern the existing Timer-Done takeover already used.
+- **Persistence switched from index to raw minutes**: `focusDurationIdx` (indexed into the old fixed `FOCUS_DURATIONS_MIN[]`) is gone, replaced by `focusDurationMin`, persisted as `"focusDurMin"` in NVS — a raw value, since Custom entries don't fit an index model.
+- **Presets are editable again** via the settings page: a new "Focus timer" block in `settings_server.cpp`'s `handleRoot()`/`handleSave()`, reusing the existing `.timer-slot`/`.timer-slot-grid` CSS (previously only used for the Bus-stop cards), persisted as `"timerPreset0"`..`"timerPreset5"`, 1-180 min range (same bound as Custom).
+
+**Assumptions flagged, not asked about:**
+1. The paused-reopen's "Resume"/"Stop" prepended rows reconcile two slightly different-sounding answers from the grilling session's first round (one described "ask whether to resume or stop," the other "picker with Resume as the first option") by including both — no objection was raised in the following round.
+2. Custom's tap-outside behaviour (closes "everything") is implemented as "return to whatever state was already live" (idle, or still paused) rather than forcing idle outright — forcing idle would cancel a paused session as a side effect of a stray tap on a sub-screen, which seemed more destructive than the old MakerPulse behaviour (which never had a paused-session case to begin with) intended.
+3. `V2_LONGPRESS_MAX_MOVE_PX = 20` (vs the tap path's 10px) is a judgment call, not spec-derived — the spec only says "imprecise" touch, not a number.
+
+**What failed along the way:** none — compiled clean on the first attempt after all the edits above.
+
+**Verified:** `pio run -e makerpulse` compiles clean (Flash 37.0% / RAM 15.9%, only pre-existing ArduinoJson deprecation warnings). Hardware verification pending — will likely go through the GitHub Pages flashing site again given this session's USB instability.

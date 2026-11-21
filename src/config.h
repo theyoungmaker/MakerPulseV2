@@ -93,6 +93,14 @@ const int V2_TAP_MAX_MOVE_PX = 10;
 
 const int V2_LONGPRESS_MS = 600;
 
+// Long-press and the Status calibration hold check the finger's CURRENT
+// distance from the anchor at each poll, not the worst-case drift ever
+// seen during the hold (see pollTouchEvent()/touchHoldMsInRect() in
+// display.cpp) -- so this can be looser than the tap tolerance above
+// without permanently disqualifying an otherwise-steady hold after one
+// noisy resistive-touch sample.
+const int V2_LONGPRESS_MAX_MOVE_PX = 20;
+
 const int V2_MIN_TOUCH_TARGET = 36;
 
 const int V2_CALIBRATION_HOLD_MS = 5000;
@@ -140,12 +148,21 @@ const int HOME_TILE_TIMER_X = 124,  HOME_TILE_TIMER_Y = 188;
 const int HOME_CLOCK_HIT_X0 = 0,   HOME_CLOCK_HIT_X1 = 180;
 const int HOME_CLOCK_HIT_Y0 = 0,   HOME_CLOCK_HIT_Y1 = 72;
 
-// Focus timer: fixed 5/10/15/25/45 min cycle (spec "Interactions" --
-// long-press while idle cycles this list; no custom entry, no per-user
-// editing). Index 3 (25 min) is the default, matching the mockups.
-static const int FOCUS_DURATIONS_MIN[] = {5, 10, 15, 25, 45};
-static const int FOCUS_DURATIONS_COUNT = 5;
-static const int FOCUS_DEFAULT_DURATION_IDX = 3;
+// Focus timer: tapping the Timer tile while idle or paused opens the
+// timer picker (display.cpp) -- six editable presets plus Custom, same
+// style as the old pre-V2.1.0 MakerPulse menu. FOCUS_PRESET_DEFAULT_MIN
+// is only the factory default for the settings-page preset fields; the
+// live values are timerPresetMin[] (state.cpp), persisted in NVS so
+// they're independently editable per device. FOCUS_DEFAULT_DURATION_MIN
+// is the duration a freshly-provisioned device starts at before the user
+// has ever run a timer (focusDurationMin then tracks whatever was last
+// actually run -- preset or custom -- persisted as a raw minute value,
+// not an index, since custom values don't fit an index model).
+static const int FOCUS_PRESET_COUNT = 6;
+static const int FOCUS_PRESET_DEFAULT_MIN[FOCUS_PRESET_COUNT] = {1, 3, 5, 10, 15, 30};
+static const int FOCUS_DEFAULT_DURATION_MIN = 5;
+static const int FOCUS_CUSTOM_MIN_MINUTES = 1;
+static const int FOCUS_CUSTOM_MAX_MINUTES = 180;
 
 enum FocusTimerState {
   TIMER_IDLE = 0,

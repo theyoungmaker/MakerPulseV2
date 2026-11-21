@@ -47,6 +47,8 @@ void drawCurrentPageFull();
 void updateCurrentPageDynamic();
 void drawColourTestScreen();
 void drawTimerDoneOverlay(bool force = false);
+void drawTimerPickerOverlay(bool force = false);
+void drawCustomTimerStepperOverlay(bool force = false);
 
 bool handleHomeTouch(int x, int y);
 bool handleHomeLongPress(int x, int y);
@@ -55,4 +57,6 @@ bool handleStatusTouch(int x, int y);
 bool handleBusTouch(int x, int y);
 bool handleBusLongPress(int x, int y);
 bool handleTimerDoneDialogTouch(int x, int y);
+bool handleTimerPickerTouch(int x, int y);
+bool handleCustomTimerStepperTouch(int x, int y);
 void handleNavTouch(int x, int y);

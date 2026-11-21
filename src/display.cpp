@@ -516,11 +516,14 @@ static String formatTimerClock(unsigned long totalSec) {
 
 
 // Spec "Timer states": idle "tap to start", running "tap to pause", paused
-// "paused · hold to reset". Done has its own takeover screen, not a tile.
+// "paused · tap for options" (reopens the picker with Resume/Stop above
+// the presets -- see CONTEXT.md's "timer picker" entry; this replaces the
+// old long-press-to-reset wording, since long-press no longer does
+// anything timer-specific). Done has its own takeover screen, not a tile.
 static String focusSubText() {
   switch (focusTimerState) {
     case TIMER_RUNNING: return "tap to pause";
-    case TIMER_PAUSED:  return String("paused ") + (char)0xC2 + (char)0xB7 + " hold to reset";
+    case TIMER_PAUSED:  return String("paused ") + (char)0xC2 + (char)0xB7 + " tap for options";
     default:            return "tap to start";
   }
 }
@@ -686,8 +689,19 @@ bool pollTouchEvent(TouchEvt& evt, bool& justPressed) {
     int dx = x - startX, dy = y - startY;
     int distSq = dx * dx + dy * dy;
     if (distSq > maxMoveSq) maxMoveSq = distSq;
-    bool withinTapMove = maxMoveSq < (V2_TAP_MAX_MOVE_PX * V2_TAP_MAX_MOVE_PX);
-    if (!longPressFired && withinTapMove && (now - pressStartMs) >= (unsigned long)V2_LONGPRESS_MS) {
+
+    // Long-press is checked against the finger's CURRENT distance from
+    // the anchor, not maxMoveSq -- a resistive touchscreen's
+    // initial-contact noise typically settles within the first ~100ms,
+    // long before the 600ms threshold, so one noisy sample early in the
+    // hold no longer permanently disqualifies an otherwise-steady press
+    // the way tracking the worst-case drift over the whole hold did.
+    // (Root-caused from a user report that long-press "does not work" --
+    // see PROJECT_LOG.md.) Tap detection below still uses maxMoveSq: it
+    // has no "current position" to check at release time, so it needs
+    // the accumulated drift.
+    bool currentlyNearAnchor = distSq < (V2_LONGPRESS_MAX_MOVE_PX * V2_LONGPRESS_MAX_MOVE_PX);
+    if (!longPressFired && currentlyNearAnchor && (now - pressStartMs) >= (unsigned long)V2_LONGPRESS_MS) {
       longPressFired = true;
       evt.type = TOUCH_LONG_PRESS;
       evt.x = startX;
@@ -729,7 +743,7 @@ unsigned long touchHoldMsInRect(int rx, int ry, int rw, int rh) {
     return 0;
   }
   int dx = x - anchorX, dy = y - anchorY;
-  if (dx * dx + dy * dy >= (V2_TAP_MAX_MOVE_PX * V2_TAP_MAX_MOVE_PX)) {
+  if (dx * dx + dy * dy >= (V2_LONGPRESS_MAX_MOVE_PX * V2_LONGPRESS_MAX_MOVE_PX)) {
     // Moved too far to still be "the same hold" -- restart the anchor
     // rather than cancel outright, so a slightly wobbly finger still works.
     anchorX = x;
@@ -914,7 +928,7 @@ void drawTimerDoneOverlay(bool force) {
   uint16_t backdrop = onAccent ? COL_ACCENT : COL_BG;
   uint16_t ink = onAccent ? COL_BG : COL_ACCENT;
 
-  String durationText = formatTimerClock((unsigned long)FOCUS_DURATIONS_MIN[focusDurationIdx] * 60UL);
+  String durationText = formatTimerClock((unsigned long)focusDurationMin * 60UL);
   String combined = durationText + "|" + String(backdrop);
   if (!force && combined == cacheTimerDone) return;
   cacheTimerDone = combined;
@@ -931,6 +945,124 @@ void drawTimerDoneOverlay(bool force) {
 
   tft.setFreeFont(&F_BODY_REG);
   tft.drawString("Tap anywhere to dismiss", SCREEN_W / 2, 200);
+  tft.setFreeFont(NULL);
+  tft.setTextDatum(TL_DATUM);
+}
+
+
+// Timer picker -- CONTEXT.md's "timer picker" entry. A flat, full-screen
+// overlay (no boxes/borders, hairlines between rows) matching the rest of
+// V2.1.0's "no boxes" visual language. Idle/paused taps on the Home Timer
+// tile open this (handleTimerTileTap() in state.cpp); while paused, two
+// extra rows ("Resume"/"Stop") are prepended above the 6 presets +
+// Custom. Row order here must exactly match handleTimerPickerTouch()'s
+// hit-testing below -- timerPickerPresetStartIdx() is the single source
+// of truth both share.
+static const int TIMER_PICKER_ROWS_Y0 = 40;
+static const int TIMER_PICKER_ROW_H = 34;
+
+static int timerPickerPresetStartIdx() {
+  return (focusTimerState == TIMER_PAUSED) ? 2 : 0;
+}
+
+static int timerPickerRowCount() {
+  return timerPickerPresetStartIdx() + FOCUS_PRESET_COUNT + 1; // presets + Custom
+}
+
+static String timerPickerRowLabel(int idx, uint16_t& color) {
+  int presetStart = timerPickerPresetStartIdx();
+  color = COL_TEXT;
+  if (focusTimerState == TIMER_PAUSED && idx == 0) { color = COL_ACCENT; return "Resume"; }
+  if (focusTimerState == TIMER_PAUSED && idx == 1) { return "Stop"; }
+  if (idx < presetStart + FOCUS_PRESET_COUNT) {
+    return String(timerPresetMin[idx - presetStart]) + " min";
+  }
+  return "Custom";
+}
+
+void drawTimerPickerOverlay(bool force) {
+  if (!timerPickerOpen) return;
+
+  int rowCount = timerPickerRowCount();
+  String combined = String(rowCount) + "|" + String(focusTimerState) + "|" + String(COL_BG);
+  if (!force && combined == cacheTimerPicker) return;
+  cacheTimerPicker = combined;
+
+  tft.fillScreen(COL_BG);
+  drawSmallCapsLabel("TIMER", SCREEN_W / 2, 16, TC_DATUM, COL_DIM, COL_BG);
+  tft.drawFastHLine(V2_MARGIN_L, TIMER_PICKER_ROWS_Y0 - 6, V2_CONTENT_W, COL_STROKE);
+
+  tft.setFreeFont(&F_BODY_REG);
+  tft.setTextDatum(TL_DATUM);
+  int fh = tft.fontHeight();
+  for (int i = 0; i < rowCount; i++) {
+    int y = TIMER_PICKER_ROWS_Y0 + i * TIMER_PICKER_ROW_H;
+    uint16_t color;
+    String label = timerPickerRowLabel(i, color);
+    tft.setTextColor(color, COL_BG);
+    tft.drawString(label, V2_MARGIN_L, y + (TIMER_PICKER_ROW_H - fh) / 2);
+    if (i < rowCount - 1) {
+      tft.drawFastHLine(V2_MARGIN_L, y + TIMER_PICKER_ROW_H - 1, V2_CONTENT_W, COL_STROKE);
+    }
+  }
+  tft.setFreeFont(NULL);
+}
+
+
+// Custom-entry stepper -- CONTEXT.md's "timer picker" entry. Replicates
+// the old pre-V2.1.0 MakerPulse handleCustomTimerEntryTouch()'s
+// Cancel-vs-tap-outside distinction: the explicit Cancel button returns
+// to the picker (one level up), while tapping outside this panel's band
+// (above TIMER_CUSTOM_PANEL_Y0 or below TIMER_CUSTOM_PANEL_Y1) closes
+// everything, landing back on whatever state was already live underneath
+// (idle, or still paused if reopened from a paused session) rather than
+// forcing idle -- cancelling a paused session via a stray outside-tap on
+// a sub-screen would be more destructive than anyone asked for.
+static const int TIMER_CUSTOM_PANEL_Y0 = 70;
+static const int TIMER_CUSTOM_PANEL_Y1 = 250;
+static const int TIMER_CUSTOM_STEP_Y0 = 160;
+static const int TIMER_CUSTOM_STEP_Y1 = 200;
+static const int TIMER_CUSTOM_ACTIONS_Y0 = 224;
+static const int TIMER_CUSTOM_ACTIONS_Y1 = 250;
+static const char* TIMER_CUSTOM_STEP_LABELS[4] = {"-5", "-1", "+1", "+5"};
+static const int TIMER_CUSTOM_STEP_DELTAS[4] = {-5, -1, 1, 5};
+
+void drawCustomTimerStepperOverlay(bool force) {
+  if (!timerCustomEntryOpen) return;
+
+  String combined = String(customTimerMinutes);
+  if (!force && combined == cacheCustomStepper) return;
+  cacheCustomStepper = combined;
+
+  tft.fillScreen(COL_BG);
+  drawSmallCapsLabel("CUSTOM TIMER", SCREEN_W / 2, 78, TC_DATUM, COL_DIM, COL_BG);
+  tft.drawFastHLine(V2_MARGIN_L, 96, V2_CONTENT_W, COL_STROKE);
+
+  tft.setFreeFont(&F_DISPLAY);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.drawString(String(customTimerMinutes) + " min", SCREEN_W / 2, 104);
+  tft.setFreeFont(NULL);
+
+  int stepW = V2_CONTENT_W / 4;
+  tft.setFreeFont(&F_TITLE);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(COL_ACCENT, COL_BG);
+  for (int i = 0; i < 4; i++) {
+    int cx = V2_MARGIN_L + stepW * i + stepW / 2;
+    tft.drawString(TIMER_CUSTOM_STEP_LABELS[i], cx, TIMER_CUSTOM_STEP_Y0 + 14);
+  }
+  tft.setFreeFont(NULL);
+
+  tft.drawFastHLine(V2_MARGIN_L, 214, V2_CONTENT_W, COL_STROKE);
+
+  tft.setFreeFont(&F_BODY_BOLD);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.drawString("Cancel", V2_MARGIN_L, TIMER_CUSTOM_ACTIONS_Y0);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(COL_ACCENT, COL_BG);
+  tft.drawString("Start", V2_MARGIN_R, TIMER_CUSTOM_ACTIONS_Y0);
   tft.setFreeFont(NULL);
   tft.setTextDatum(TL_DATUM);
 }
@@ -2246,12 +2378,22 @@ void drawCurrentPageFull() {
   }
 
   if (focusTimerState == TIMER_DONE) drawTimerDoneOverlay(true);
+  else if (timerCustomEntryOpen) drawCustomTimerStepperOverlay(true);
+  else if (timerPickerOpen) drawTimerPickerOverlay(true);
 }
 
 
 void updateCurrentPageDynamic() {
   if (focusTimerState == TIMER_DONE) {
     drawTimerDoneOverlay(false);
+    return;
+  }
+  if (timerCustomEntryOpen) {
+    drawCustomTimerStepperOverlay(false);
+    return;
+  }
+  if (timerPickerOpen) {
+    drawTimerPickerOverlay(false);
     return;
   }
 
@@ -2299,7 +2441,7 @@ bool handleHomeTouch(int x, int y) {
 
   getHomeTileRect(3, tx, ty, tw, th); // Timer
   if (x >= tx && x < tx + tw && y >= ty && y < ty + th) {
-    startOrToggleFocusTimer();
+    handleTimerTileTap();
     return true;
   }
 
@@ -2308,7 +2450,9 @@ bool handleHomeTouch(int x, int y) {
 
 
 // Spec "Home" > "Interactions": Clock long-press toggles 12h/24h (saved).
-// Timer tile long-press: idle cycles the duration, paused resets.
+// The Timer tile no longer has a long-press action -- idle/paused taps
+// open the picker instead (handleHomeTouch() above); see CONTEXT.md's
+// "timer picker" entry.
 bool handleHomeLongPress(int x, int y) {
   if (currentPage != PAGE_HOME) return false;
   if (focusTimerState == TIMER_DONE) return false;
@@ -2317,14 +2461,6 @@ bool handleHomeLongPress(int x, int y) {
     saveClockIs24h(!clockIs24h);
     cacheClock = "";
     pageDirty = true;
-    return true;
-  }
-
-  int tx, ty, tw, th;
-  getHomeTileRect(3, tx, ty, tw, th); // Timer
-  if (x >= tx && x < tx + tw && y >= ty && y < ty + th) {
-    if (focusTimerState == TIMER_IDLE) cycleFocusDuration();
-    else if (focusTimerState == TIMER_PAUSED) resetFocusTimerToIdle();
     return true;
   }
 
@@ -2338,6 +2474,61 @@ bool handleTimerDoneDialogTouch(int x, int y) {
   if (focusTimerState != TIMER_DONE) return false;
   dismissTimerDone();
   return true;
+}
+
+
+// Hit-testing mirrors drawTimerPickerOverlay()'s row layout exactly --
+// same timerPickerPresetStartIdx()/TIMER_PICKER_ROWS_Y0/ROW_H constants.
+bool handleTimerPickerTouch(int x, int y) {
+  if (!timerPickerOpen) return false;
+  (void)x;
+
+  int rowCount = timerPickerRowCount();
+  int idx = (y - TIMER_PICKER_ROWS_Y0) / TIMER_PICKER_ROW_H;
+  if (y < TIMER_PICKER_ROWS_Y0 || idx < 0 || idx >= rowCount) return true; // modal: swallow, no row hit
+
+  int presetStart = timerPickerPresetStartIdx();
+  if (focusTimerState == TIMER_PAUSED && idx == 0) { resumeFocusTimer(); return true; }
+  if (focusTimerState == TIMER_PAUSED && idx == 1) { stopFocusTimerToIdle(); return true; }
+  if (idx < presetStart + FOCUS_PRESET_COUNT) {
+    startFocusTimerWithMinutes(timerPresetMin[idx - presetStart]);
+    return true;
+  }
+  openCustomTimerStepper();
+  return true;
+}
+
+
+// Hit-testing mirrors drawCustomTimerStepperOverlay()'s layout exactly.
+// Outside the panel band (y < TIMER_CUSTOM_PANEL_Y0 or
+// y >= TIMER_CUSTOM_PANEL_Y1) closes everything via closeTimerPicker() --
+// see the comment above drawCustomTimerStepperOverlay() for why that's
+// the right target rather than forcing idle.
+bool handleCustomTimerStepperTouch(int x, int y) {
+  if (!timerCustomEntryOpen) return false;
+
+  if (y < TIMER_CUSTOM_PANEL_Y0 || y >= TIMER_CUSTOM_PANEL_Y1) {
+    closeTimerPicker();
+    return true;
+  }
+
+  if (y >= TIMER_CUSTOM_STEP_Y0 && y < TIMER_CUSTOM_STEP_Y1) {
+    int stepW = V2_CONTENT_W / 4;
+    int i = (x - V2_MARGIN_L) / stepW;
+    if (i >= 0 && i < 4) adjustCustomTimerMinutes(TIMER_CUSTOM_STEP_DELTAS[i]);
+    return true;
+  }
+
+  if (y >= TIMER_CUSTOM_ACTIONS_Y0 - 8 && y < TIMER_CUSTOM_ACTIONS_Y1) {
+    if (x < SCREEN_W / 2) {
+      cancelCustomTimerStepper();
+    } else {
+      startFocusTimerWithMinutes(customTimerMinutes);
+    }
+    return true;
+  }
+
+  return true; // inside the panel but not on a control -- swallow, no-op
 }
 
 

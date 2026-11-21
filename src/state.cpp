@@ -211,6 +211,10 @@ String cacheFocusTimer = "";
 
 String cacheTimerDone = "";
 
+String cacheTimerPicker = "";
+
+String cacheCustomStepper = "";
+
 
 String lastUvText = "";
 
@@ -343,13 +347,24 @@ void clearHomeTileCaches() {
 // Focus timer -- spec "Timer states": idle / running / paused / done.
 FocusTimerState focusTimerState = TIMER_IDLE;
 
-int focusDurationIdx = FOCUS_DEFAULT_DURATION_IDX;
+int focusDurationMin = FOCUS_DEFAULT_DURATION_MIN;
 
 unsigned long focusEndMs = 0;
 
-unsigned long focusRemainingSec = (unsigned long)FOCUS_DURATIONS_MIN[FOCUS_DEFAULT_DURATION_IDX] * 60UL;
+unsigned long focusRemainingSec = (unsigned long)FOCUS_DEFAULT_DURATION_MIN * 60UL;
 
 unsigned long focusDoneStartedMs = 0;
+
+int timerPresetMin[FOCUS_PRESET_COUNT] = {
+  FOCUS_PRESET_DEFAULT_MIN[0], FOCUS_PRESET_DEFAULT_MIN[1], FOCUS_PRESET_DEFAULT_MIN[2],
+  FOCUS_PRESET_DEFAULT_MIN[3], FOCUS_PRESET_DEFAULT_MIN[4], FOCUS_PRESET_DEFAULT_MIN[5]
+};
+
+bool timerPickerOpen = false;
+
+bool timerCustomEntryOpen = false;
+
+int customTimerMinutes = FOCUS_DEFAULT_DURATION_MIN;
 
 bool wifiEnabled = true;
 
@@ -546,53 +561,115 @@ int minutesNowLocal() {
 
 
 
-// Spec "Home" > "Interactions"/"Timer states": tap starts/pauses/resumes;
-// long-press cycles the duration while idle or resets while paused (see
-// cycleFocusDuration()/resetFocusTimerToIdle() below). Done has its own
-// dismiss gesture (any tap, anywhere) rather than reusing this tap handler.
-void startOrToggleFocusTimer() {
+int sanitizeTimerMinutes(int minutes) {
+  return constrain(minutes, FOCUS_CUSTOM_MIN_MINUTES, FOCUS_CUSTOM_MAX_MINUTES);
+}
+
+
+void saveTimerPreset(int idx, int minutes) {
+  if (idx < 0 || idx >= FOCUS_PRESET_COUNT) return;
+  timerPresetMin[idx] = sanitizeTimerMinutes(minutes);
+  prefs.putInt((String("timerPreset") + String(idx)).c_str(), timerPresetMin[idx]);
+}
+
+
+// Spec "Home" > "Interactions"/"Timer states": tap is state-aware -- idle
+// and paused both open the timer picker (display.cpp) rather than
+// starting/resuming directly, since picking a preset or Custom is itself
+// "go" (matches the old pre-V2.1.0 MakerPulse menu: selecting a duration
+// starts the timer, it's not a separate select-then-press-start step).
+// Running still just pauses on tap, unchanged. Done has its own dismiss
+// gesture (any tap, anywhere) rather than reusing this tap handler.
+void handleTimerTileTap() {
   switch (focusTimerState) {
-    case TIMER_IDLE: {
-      unsigned long durationSec = (unsigned long)FOCUS_DURATIONS_MIN[focusDurationIdx] * 60UL;
-      focusRemainingSec = durationSec;
-      focusEndMs = millis() + durationSec * 1000UL;
-      focusTimerState = TIMER_RUNNING;
+    case TIMER_IDLE:
+    case TIMER_PAUSED:
+      openTimerPicker();
       break;
-    }
     case TIMER_RUNNING:
       focusTimerState = TIMER_PAUSED; // freezes focusRemainingSec as-is
-      break;
-    case TIMER_PAUSED:
-      focusEndMs = millis() + focusRemainingSec * 1000UL;
-      focusTimerState = TIMER_RUNNING;
+      cacheFocusTimer = "";
+      clearHomeTileCaches();
+      pageDirty = true;
       break;
     case TIMER_DONE:
       break;
   }
-  cacheFocusTimer = "";
-  clearHomeTileCaches();
+}
+
+
+void openTimerPicker() {
+  timerPickerOpen = true;
+  timerCustomEntryOpen = false;
+  cacheTimerPicker = "";
   pageDirty = true;
 }
 
 
-void cycleFocusDuration() {
-  if (focusTimerState != TIMER_IDLE) return;
-  focusDurationIdx = (focusDurationIdx + 1) % FOCUS_DURATIONS_COUNT;
-  focusRemainingSec = (unsigned long)FOCUS_DURATIONS_MIN[focusDurationIdx] * 60UL;
-  prefs.putInt("focusDurIdx", focusDurationIdx);
-  cacheFocusTimer = "";
-  clearHomeTileCaches();
+void closeTimerPicker() {
+  timerPickerOpen = false;
+  timerCustomEntryOpen = false;
   pageDirty = true;
 }
 
 
-void resetFocusTimerToIdle() {
+void resumeFocusTimer() {
   if (focusTimerState != TIMER_PAUSED) return;
-  focusTimerState = TIMER_IDLE;
-  focusRemainingSec = (unsigned long)FOCUS_DURATIONS_MIN[focusDurationIdx] * 60UL;
-  focusEndMs = 0;
+  focusEndMs = millis() + focusRemainingSec * 1000UL;
+  focusTimerState = TIMER_RUNNING;
+  closeTimerPicker();
   cacheFocusTimer = "";
   clearHomeTileCaches();
+}
+
+
+void stopFocusTimerToIdle() {
+  focusTimerState = TIMER_IDLE;
+  focusRemainingSec = (unsigned long)focusDurationMin * 60UL;
+  focusEndMs = 0;
+  closeTimerPicker();
+  cacheFocusTimer = "";
+  clearHomeTileCaches();
+}
+
+
+void startFocusTimerWithMinutes(int minutes) {
+  minutes = sanitizeTimerMinutes(minutes);
+  focusDurationMin = minutes;
+  prefs.putInt("focusDurMin", minutes);
+  focusRemainingSec = (unsigned long)minutes * 60UL;
+  focusEndMs = millis() + focusRemainingSec * 1000UL;
+  focusTimerState = TIMER_RUNNING;
+  closeTimerPicker();
+  cacheFocusTimer = "";
+  clearHomeTileCaches();
+}
+
+
+// Pre-fills with focusDurationMin -- "whatever duration was last actually
+// run", not a fixed default like the old pre-V2.1.0 "20 min".
+void openCustomTimerStepper() {
+  timerCustomEntryOpen = true;
+  customTimerMinutes = sanitizeTimerMinutes(focusDurationMin);
+  cacheCustomStepper = "";
+  pageDirty = true;
+}
+
+
+void adjustCustomTimerMinutes(int delta) {
+  if (!timerCustomEntryOpen) return;
+  customTimerMinutes = sanitizeTimerMinutes(customTimerMinutes + delta);
+  cacheCustomStepper = "";
+  pageDirty = true;
+}
+
+
+// Explicit Cancel button: back to the picker (one level up), not all the
+// way to idle -- see CONTEXT.md's "timer picker" entry for the distinction
+// from tapping outside the stepper, which closes everything instead.
+void cancelCustomTimerStepper() {
+  timerCustomEntryOpen = false;
+  cacheTimerPicker = "";
   pageDirty = true;
 }
 
@@ -600,7 +677,7 @@ void resetFocusTimerToIdle() {
 void dismissTimerDone() {
   if (focusTimerState != TIMER_DONE) return;
   focusTimerState = TIMER_IDLE;
-  focusRemainingSec = (unsigned long)FOCUS_DURATIONS_MIN[focusDurationIdx] * 60UL;
+  focusRemainingSec = (unsigned long)focusDurationMin * 60UL;
   focusDoneStartedMs = 0;
   cacheTimerDone = "";
   cacheFocusTimer = "";
@@ -826,9 +903,11 @@ void loadStoredSettings() {
   nightModeKey     = prefs.getString("nightMode", "off");
   if (nightModeKey != "auto") nightModeKey = "off";
   favBusService    = prefs.getString("favBusSvc", "");
-  focusDurationIdx = prefs.getInt("focusDurIdx", FOCUS_DEFAULT_DURATION_IDX);
-  if (focusDurationIdx < 0 || focusDurationIdx >= FOCUS_DURATIONS_COUNT) focusDurationIdx = FOCUS_DEFAULT_DURATION_IDX;
-  focusRemainingSec = (unsigned long)FOCUS_DURATIONS_MIN[focusDurationIdx] * 60UL;
+  focusDurationMin = sanitizeTimerMinutes(prefs.getInt("focusDurMin", FOCUS_DEFAULT_DURATION_MIN));
+  focusRemainingSec = (unsigned long)focusDurationMin * 60UL;
+  for (int i = 0; i < FOCUS_PRESET_COUNT; i++) {
+    timerPresetMin[i] = sanitizeTimerMinutes(prefs.getInt((String("timerPreset") + String(i)).c_str(), FOCUS_PRESET_DEFAULT_MIN[i]));
+  }
   wifiEnabled      = prefs.getBool("wifiEnabled", true);
   datagovApiKey    = prefs.getString("datagovKey", "");
   ltaApiKey        = prefs.getString("ltaKey", "");

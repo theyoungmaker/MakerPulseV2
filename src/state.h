@@ -115,6 +115,8 @@ extern String cacheClock, cacheTemp, cacheRain, cacheWeek, cacheHomeEmpty1, cach
 extern String cacheFocusTimer;
 extern String cacheHomeTiles[4];
 extern String cacheTimerDone;
+extern String cacheTimerPicker;
+extern String cacheCustomStepper;
 
 extern String lastUvText, lastPsiText;
 extern String lastNowText, lastHourlyText, lastBusPageText;
@@ -129,15 +131,31 @@ void applyDeviceTimezoneByKey(const String& key);
 void getHomeTileRect(int tileIdx, int& x, int& y, int& w, int& h);
 void clearHomeTileCaches();
 
-// Spec "Timer states": idle / running / paused / done. focusDurationIdx
-// indexes FOCUS_DURATIONS_MIN (config.h) -- the chosen duration, persisted
-// in NVS, cycled via long-press while idle. focusRemainingSec is the live
-// countdown while running or paused; focusEndMs is only meaningful while
-// running (millis() target for when it hits zero).
+// Spec "Timer states": idle / running / paused / done. focusDurationMin is
+// the chosen duration in minutes -- persisted in NVS as a raw value (not
+// an index, since Custom entries don't fit a fixed-list index model),
+// updated to whatever was last actually run, preset or custom alike.
+// focusRemainingSec is the live countdown while running or paused;
+// focusEndMs is only meaningful while running (millis() target for when
+// it hits zero).
 extern FocusTimerState focusTimerState;
-extern int focusDurationIdx;
+extern int focusDurationMin;
 extern unsigned long focusEndMs, focusRemainingSec;
 extern unsigned long focusDoneStartedMs;
+
+// The 6 preset durations shown in the timer picker -- editable via the
+// settings page (CONTEXT.md's "timer picker" entry), defaulting to
+// FOCUS_PRESET_DEFAULT_MIN. Index order is display order, not magnitude
+// order, though in practice the defaults are already ascending.
+extern int timerPresetMin[FOCUS_PRESET_COUNT];
+int sanitizeTimerMinutes(int minutes);
+void saveTimerPreset(int idx, int minutes);
+
+// Timer picker / Custom-entry overlay UI state -- not persisted, reset to
+// closed on every boot. See CONTEXT.md's "timer picker" entry.
+extern bool timerPickerOpen;
+extern bool timerCustomEntryOpen;
+extern int customTimerMinutes; // working value while the Custom stepper is open
 extern bool wifiEnabled, wifiConnectInProgress;
 extern unsigned long wifiConnectStartedMs;
 
@@ -214,10 +232,19 @@ int ymdFromLocal(time_t t);
 int minutesFromLocalEpoch(time_t t);
 int minutesNowLocal();
 
-// Spec "Home" > "Interactions"/"Timer states".
-void startOrToggleFocusTimer();  // tap: idle->running, running->paused, paused->running
-void cycleFocusDuration();       // long-press while idle: 5->10->15->25->45->5...
-void resetFocusTimerToIdle();    // long-press while paused
+// Spec "Home" > "Interactions"/"Timer states": tap handling is state-aware
+// (handleTimerTileTap()) rather than one toggle function, now that idle
+// and paused taps both open the picker instead of starting/resuming
+// directly.
+void handleTimerTileTap();      // tap: idle/paused->opens picker, running->pause
+void openTimerPicker();
+void closeTimerPicker();        // closes picker and/or Custom stepper, no state change
+void resumeFocusTimer();        // picker's "Resume" row, only valid while paused
+void stopFocusTimerToIdle();    // picker's "Stop" row, only valid while paused
+void startFocusTimerWithMinutes(int minutes); // picker preset row or Custom's "Start"
+void openCustomTimerStepper();  // picker's "Custom" row
+void adjustCustomTimerMinutes(int delta);
+void cancelCustomTimerStepper(); // Custom's "Cancel" button -- back to the picker
 void dismissTimerDone();         // tap anywhere while done, or 60s auto-dismiss
 void updateFocusTimerState();    // ticks the running countdown; running->done at zero
 void updateTimerDoneAutoDismiss();

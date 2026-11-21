@@ -225,6 +225,15 @@ void handleRoot() {
   page += "<div><label class='label'>Latitude</label><input name='lat' value='" + String(LAT, 6) + "'></div>";
   page += "<div><label class='label'>Longitude</label><input name='lng' value='" + String(LNG, 6) + "'></div>";
   page += "</div><div class='footer-note'>Example Singapore: latitude 1.3521, longitude 103.8198.</div></div>";
+  page += "<div class='settings-block'><span class='settings-title'>Focus timer</span><div class='settings-desc'>The six presets shown when you tap the Timer tile on the device. Each is 1-180 minutes; there's always a Custom option on the device too.</div>";
+  page += "<div class='timer-slot-grid'>";
+  for (int i = 0; i < FOCUS_PRESET_COUNT; i++) {
+    page += "<div class='timer-slot'>";
+    page += "<div class='timer-slot-head'>Preset " + String(i + 1) + "</div>";
+    page += "<div class='timer-slot-input'><input type='number' name='timerPreset" + String(i) + "' min='" + String(FOCUS_CUSTOM_MIN_MINUTES) + "' max='" + String(FOCUS_CUSTOM_MAX_MINUTES) + "' value='" + String(timerPresetMin[i]) + "'><span class='timer-unit'>min</span></div>";
+    page += "</div>";
+  }
+  page += "</div></div>";
   page += "<div class='settings-block'><span class='settings-title'>Air quality (PSI)</span><div class='settings-desc'>National 24-hour PSI reading shown on the Weather page, via the data.gov.sg v2 real-time API. Request a free API key at <a href='https://api-open.data.gov.sg/' target='_blank'>api-open.data.gov.sg</a> and enter it below.</div><div class='grid'>";
   page += "<div><label class='label'>data.gov.sg API key</label><input name='datagovKey' value='" + htmlEscape(datagovApiKey) + "'></div>";
   page += "</div></div>";
@@ -325,6 +334,12 @@ void handleSave() {
     busStopCodeChanged[i] = (newBusStops[i].code != busStops[i].code);
   }
 
+  int newTimerPresets[FOCUS_PRESET_COUNT];
+  for (int i = 0; i < FOCUS_PRESET_COUNT; i++) {
+    String key = String("timerPreset") + String(i);
+    newTimerPresets[i] = server.hasArg(key) ? sanitizeTimerMinutes(server.arg(key).toInt()) : timerPresetMin[i];
+  }
+
   newLoc.trim();
   newNickname.trim();
   newOwnerName.trim();
@@ -365,6 +380,9 @@ void handleSave() {
   timezoneKey = newTz;
   datagovApiKey = newDatagovKey;
   ltaApiKey = newLtaKey;
+  for (int i = 0; i < FOCUS_PRESET_COUNT; i++) {
+    saveTimerPreset(i, newTimerPresets[i]);
+  }
   for (int i = 0; i < BUS_MAX_STOPS; i++) {
     busStops[i] = newBusStops[i];
     if (busStopCodeChanged[i]) {
@@ -410,6 +428,7 @@ void handleSave() {
   cacheHomeEmpty2 = "";
   cacheFocusTimer = "";
   cacheTimerDone = "";
+  cacheTimerPicker = "";
   clearHomeTileCaches();
 
   lastNowText = "";

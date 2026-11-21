@@ -203,7 +203,11 @@ void loop() {
 
     if (evt.type == TOUCH_TAP) {
       if (!handleTimerDoneDialogTouch(tx, ty)) {
-        if (tx >= SCREEN_W - 36 && ty <= TOPBAR_H) {
+        if (timerCustomEntryOpen) {
+          handleCustomTimerStepperTouch(tx, ty);
+        } else if (timerPickerOpen) {
+          handleTimerPickerTouch(tx, ty);
+        } else if (tx >= SCREEN_W - 36 && ty <= TOPBAR_H) {
           toggleSleepMode();
           pageDirty = true;
         } else if (!handleHomeTouch(tx, ty) && !handleWeatherTouch(tx, ty) && !handleStatusTouch(tx, ty) && !handleBusTouch(tx, ty)) {
@@ -213,17 +217,23 @@ void loop() {
     } else if (evt.type == TOUCH_LONG_PRESS) {
       // Phase 7: STATUS header 5s hold runs touch calibration via
       // touchHoldMsInRect(), independent of this 600ms event -- a no-op
-      // here for now, not a missed case.
+      // here for now, not a missed case. The timer picker/Custom stepper
+      // have no long-press action of their own, so no guard needed here
+      // the way the tap branch above needs one.
       if (!handleHomeLongPress(tx, ty)) handleBusLongPress(tx, ty);
     }
   }
 
   if (pageDirty || lastDrawnPage != currentPage) {
-    bool anyOverlayOpen = (focusTimerState == TIMER_DONE);
+    bool anyOverlayOpen = (focusTimerState == TIMER_DONE) || timerPickerOpen || timerCustomEntryOpen;
     if (lastDrawnPage != currentPage || !anyOverlayOpen) {
       drawCurrentPageFull();
     } else if (focusTimerState == TIMER_DONE) {
       drawTimerDoneOverlay(true);
+    } else if (timerCustomEntryOpen) {
+      drawCustomTimerStepperOverlay(true);
+    } else if (timerPickerOpen) {
+      drawTimerPickerOverlay(true);
     }
     updateCurrentPageDynamic();
     pageDirty = false;
