@@ -959,7 +959,7 @@ void drawTimerDoneOverlay(bool force) {
 // hit-testing below -- timerPickerPresetStartIdx() is the single source
 // of truth both share.
 static const int TIMER_PICKER_ROWS_Y0 = 40;
-static const int TIMER_PICKER_ROW_H = 34;
+static const int TIMER_PICKER_ROW_H_MAX = 34;
 
 static int timerPickerPresetStartIdx() {
   return (focusTimerState == TIMER_PAUSED) ? 2 : 0;
@@ -967,6 +967,17 @@ static int timerPickerPresetStartIdx() {
 
 static int timerPickerRowCount() {
   return timerPickerPresetStartIdx() + FOCUS_PRESET_COUNT + 1; // presets + Custom
+}
+
+// Paused prepends Resume+Stop, so the picker can show up to 9 rows (vs 7
+// idle) -- 9 rows at the capped 34px height would overflow the 320px
+// screen by 26px, pushing Custom off the bottom. Row height instead
+// shrinks to fit whatever's actually showing, capped at 34px so the
+// common 7-row idle case still gets comfortably-sized rows.
+static int timerPickerRowH() {
+  int rowCount = timerPickerRowCount();
+  int available = SCREEN_H - TIMER_PICKER_ROWS_Y0;
+  return min(TIMER_PICKER_ROW_H_MAX, available / rowCount);
 }
 
 static String timerPickerRowLabel(int idx, uint16_t& color) {
@@ -992,17 +1003,18 @@ void drawTimerPickerOverlay(bool force) {
   drawSmallCapsLabel("TIMER", SCREEN_W / 2, 16, TC_DATUM, COL_DIM, COL_BG);
   tft.drawFastHLine(V2_MARGIN_L, TIMER_PICKER_ROWS_Y0 - 6, V2_CONTENT_W, COL_STROKE);
 
+  int rowH = timerPickerRowH();
   tft.setFreeFont(&F_BODY_REG);
   tft.setTextDatum(TL_DATUM);
   int fh = tft.fontHeight();
   for (int i = 0; i < rowCount; i++) {
-    int y = TIMER_PICKER_ROWS_Y0 + i * TIMER_PICKER_ROW_H;
+    int y = TIMER_PICKER_ROWS_Y0 + i * rowH;
     uint16_t color;
     String label = timerPickerRowLabel(i, color);
     tft.setTextColor(color, COL_BG);
-    tft.drawString(label, V2_MARGIN_L, y + (TIMER_PICKER_ROW_H - fh) / 2);
+    tft.drawString(label, V2_MARGIN_L, y + (rowH - fh) / 2);
     if (i < rowCount - 1) {
-      tft.drawFastHLine(V2_MARGIN_L, y + TIMER_PICKER_ROW_H - 1, V2_CONTENT_W, COL_STROKE);
+      tft.drawFastHLine(V2_MARGIN_L, y + rowH - 1, V2_CONTENT_W, COL_STROKE);
     }
   }
   tft.setFreeFont(NULL);
@@ -2484,7 +2496,7 @@ bool handleTimerPickerTouch(int x, int y) {
   (void)x;
 
   int rowCount = timerPickerRowCount();
-  int idx = (y - TIMER_PICKER_ROWS_Y0) / TIMER_PICKER_ROW_H;
+  int idx = (y - TIMER_PICKER_ROWS_Y0) / timerPickerRowH();
   if (y < TIMER_PICKER_ROWS_Y0 || idx < 0 || idx >= rowCount) return true; // modal: swallow, no row hit
 
   int presetStart = timerPickerPresetStartIdx();
